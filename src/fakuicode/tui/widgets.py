@@ -21,30 +21,22 @@ from fakuicode.models import ProviderConfig, ToolCall, ToolResult
 APP_VERSION = "0.1.0"
 
 _BRAND_LOGO_GRID = (
-    "................................DDD",
-    "................DDDD...........DRRD",
-    "..............DRRRRRRRRRDDDD..DRDD.",
-    "............DRRRRRRRRRDDDD..DDRD...",
-    "...........DRRRDDDDGGR.....DRDD....",
-    "..........DDDDDDDDRRRD....DRD......",
-    "...............RRRRDDRRRDDRD.......",
-    "...............RRRDDDDRRRRRRRDDD...",
-    "...............RDDDDD.DDDRRRRRRDDD.",
-    "...............DDDDDDRRDDDDRRRRRDDD",
-    "................DDDDDD..DD.DDDDRDDD",
-    "...............DDDRDD....DD....DDD.",
-    "..............DDDRDDD....DD........",
-    ".............DDDRDDDDD...DD........",
-    "............DRDD.DD.DD..DDD........",
-    "...........DRDD..DD..DD.DDD........",
-    "..........DRDD..DD...DD............",
-    "........DDRD....DD....DD...........",
-    "......DDRRD....DDD....DDD..........",
-    ".....DDRD......DD......DD..........",
-    "...DRGDD......DDD......DDD.........",
-    "..DGGRD.......DDD.......DDD........",
-    ".DGGD........DRRD.......DRD........",
-    "DDD.........DDRDD........DRDD......",
+    "......................DD",
+    "..........RRRRRRDDD..RD.",
+    "........DRRRRRRDDD.DDD..",
+    ".......DDDDDRGG...DD....",
+    "..........RRRDRRDDR.....",
+    "..........RDDD.DDRRRRDD.",
+    "..........DDDDRRDDDRRRDD",
+    "..........DDRD...DD..DD.",
+    "..........DDDD...DD.....",
+    "........DRD.D.D.DDD.....",
+    "........RD..D.DDDDD.....",
+    ".....DDR...D...D........",
+    "....DRRD..DD...DD.......",
+    "..DGD.....DD....DD......",
+    ".DGRD.....DD....DDD.....",
+    "DD......DDDD.....DRD....",
 )
 _BRAND_LOGO_COLORS = {
     "R": "#ef4444",
@@ -54,16 +46,27 @@ _BRAND_LOGO_COLORS = {
 
 
 def _render_brand_logo() -> Text:
-    """Render the confirmed logo grid with portable background-color cells."""
+    """Pack two logical pixel rows into each terminal row with half blocks."""
     logo = Text()
-    styles = {
-        marker: Style(bgcolor=color)
-        for marker, color in _BRAND_LOGO_COLORS.items()
-    }
-    for row_index, row in enumerate(_BRAND_LOGO_GRID):
-        for marker in row:
-            logo.append(" ", style=styles.get(marker))
-        if row_index < len(_BRAND_LOGO_GRID) - 1:
+    row_pairs = zip(_BRAND_LOGO_GRID[::2], _BRAND_LOGO_GRID[1::2], strict=True)
+    for row_index, (top_row, bottom_row) in enumerate(row_pairs):
+        for top, bottom in zip(top_row, bottom_row, strict=True):
+            top_color = _BRAND_LOGO_COLORS.get(top)
+            bottom_color = _BRAND_LOGO_COLORS.get(bottom)
+            if top_color is None and bottom_color is None:
+                logo.append(" ")
+            elif top_color is None:
+                logo.append("▄", style=Style(color=bottom_color))
+            elif bottom_color is None:
+                logo.append("▀", style=Style(color=top_color))
+            elif top_color == bottom_color:
+                logo.append(" ", style=Style(bgcolor=top_color))
+            else:
+                logo.append(
+                    "▀",
+                    style=Style(color=top_color, bgcolor=bottom_color),
+                )
+        if row_index < len(_BRAND_LOGO_GRID) // 2 - 1:
             logo.append("\n")
     return logo
 

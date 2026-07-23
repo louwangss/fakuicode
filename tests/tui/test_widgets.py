@@ -17,7 +17,7 @@ def _brand_render_lines(width: int) -> list[list[Segment]]:
         "https://api.example.test/v1",
         "never-show-this-key",
     )
-    panel = BrandPanel(config, r"C:\work\[literal]")
+    panel = BrandPanel(config, r"C:\Users\example\Desktop\fakuicode\[literal]")
     console = Console(width=width, color_system="truecolor", force_terminal=True)
     return console.render_lines(panel.render(), console.options.update(width=width), pad=False)
 
@@ -26,13 +26,13 @@ def _rendered_line_text(line: list[Segment]) -> str:
     return "".join(segment.text for segment in line)
 
 
-def _background_columns(line: list[Segment]) -> list[int]:
+def _colored_columns(line: list[Segment]) -> list[int]:
     columns: list[int] = []
     offset = 0
     for segment in line:
         text = segment.text
         style = segment.style
-        if style is not None and style.bgcolor is not None:
+        if style is not None and (style.color is not None or style.bgcolor is not None):
             columns.extend(range(offset, offset + len(text)))
         offset += len(text)
     return columns
@@ -41,30 +41,48 @@ def _background_columns(line: list[Segment]) -> list[int]:
 def test_brand_logo_grid_has_the_confirmed_dimensions_and_palette() -> None:
     from fakuicode.tui.widgets import _BRAND_LOGO_GRID
 
-    assert len(_BRAND_LOGO_GRID) == 24
-    assert {len(row) for row in _BRAND_LOGO_GRID} == {35}
+    assert len(_BRAND_LOGO_GRID) == 16
+    assert {len(row) for row in _BRAND_LOGO_GRID} == {24}
     assert set("".join(_BRAND_LOGO_GRID)) == {".", "R", "D", "G"}
 
 
-def test_brand_logo_renders_exact_background_colors_and_transparency() -> None:
+def test_brand_logo_half_cells_reconstruct_every_logical_pixel() -> None:
     from rich.console import Console
 
     from fakuicode.tui.widgets import _BRAND_LOGO_GRID, _render_brand_logo
 
     logo = _render_brand_logo()
     console = Console(color_system="truecolor")
-    expected_colors = {"R": "#ef4444", "D": "#7f1d1d", "G": "#d1d5db"}
+    markers_by_color = {
+        "#ef4444": "R",
+        "#7f1d1d": "D",
+        "#d1d5db": "G",
+    }
+    rendered_lines = logo.plain.splitlines()
 
-    assert logo.plain == "\n".join(" " * 35 for _ in range(24))
-    for marker, expected in expected_colors.items():
-        row = next(index for index, value in enumerate(_BRAND_LOGO_GRID) if marker in value)
-        column = _BRAND_LOGO_GRID[row].index(marker)
-        style = logo.get_style_at_offset(console, row * 36 + column)
-        assert style.bgcolor is not None
-        assert style.bgcolor.get_truecolor().hex == expected
+    assert len(rendered_lines) == 8
+    assert {len(line) for line in rendered_lines} == {24}
+    assert set(logo.plain.replace("\n", "")) <= {" ", "▀", "▄"}
 
-    transparent_style = logo.get_style_at_offset(console, 0)
-    assert transparent_style.bgcolor is None
+    reconstructed: list[str] = []
+    for logical_row in range(16):
+        row: list[str] = []
+        for column in range(24):
+            offset = (logical_row // 2) * 25 + column
+            glyph = logo.plain[offset]
+            style = logo.get_style_at_offset(console, offset)
+            if glyph == " ":
+                color = style.bgcolor
+            elif glyph == "▀":
+                color = style.color if logical_row % 2 == 0 else style.bgcolor
+            else:
+                assert glyph == "▄"
+                color = style.bgcolor if logical_row % 2 == 0 else style.color
+            color_hex = color.get_truecolor().hex if color is not None else None
+            row.append(markers_by_color.get(color_hex, "."))
+        reconstructed.append("".join(row))
+
+    assert tuple(reconstructed) == _BRAND_LOGO_GRID
 
 
 def test_brand_panel_keeps_literal_metadata_without_sensitive_configuration() -> None:
@@ -73,7 +91,7 @@ def test_brand_panel_keeps_literal_metadata_without_sensitive_configuration() ->
 
     assert "Fakuicode v0.1.0" in visible
     assert "claude-test[bold]" in visible
-    assert r"C:\work\[literal]" in visible
+    assert r"C:\Users\example\Desktop\fakuicode\[literal]" in visible
     assert "anthropic" not in visible.lower()
     assert "never-show-this-key" not in visible
     assert "MCP" not in visible
@@ -84,7 +102,7 @@ def test_brand_panel_places_logo_left_of_information_when_wide() -> None:
     lines = _brand_render_lines(100)
     title_row = next(index for index, line in enumerate(lines) if "Fakuicode" in _rendered_line_text(line))
     title_line = _rendered_line_text(lines[title_row])
-    colored_columns = _background_columns(lines[title_row])
+    colored_columns = _colored_columns(lines[title_row])
 
     assert colored_columns
     assert min(colored_columns) < title_line.index("Fakuicode")
@@ -95,13 +113,17 @@ def test_brand_panel_stacks_information_above_complete_logo_when_narrow() -> Non
     visible_lines = [_rendered_line_text(line) for line in lines]
     title_row = next(index for index, line in enumerate(visible_lines) if "Fakuicode" in line)
     model_row = next(index for index, line in enumerate(visible_lines) if "claude-test[bold]" in line)
-    directory_row = next(index for index, line in enumerate(visible_lines) if r"C:\work\[literal]" in line)
-    colored_rows = [index for index, line in enumerate(lines) if _background_columns(line)]
+    directory_row = next(
+        index
+        for index, line in enumerate(visible_lines)
+        if r"C:\Users\example\Desktop\fakuicode\[literal]" in line
+    )
+    colored_rows = [index for index, line in enumerate(lines) if _colored_columns(line)]
 
     assert title_row < colored_rows[0]
     assert model_row < colored_rows[0]
     assert directory_row < colored_rows[0]
-    assert len(colored_rows) == 24
+    assert len(colored_rows) == 8
 
 
 def test_tool_activity_displays_a_compact_success_without_output_body() -> None:

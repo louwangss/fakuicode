@@ -2741,6 +2741,7 @@ def test_conversation_contains_startup_information_that_scrolls_with_messages() 
             conversation = app.query_one("#conversation", VerticalScroll)
             brand = app.query_one(BrandPanel)
             assert brand.parent is conversation
+            assert brand.region.height <= 12
 
             editor = app.query_one(PromptEditor)
             editor.text = "show a long reply"
