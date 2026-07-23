@@ -14,7 +14,12 @@ from fakuicode.permissions.config import PermissionConfigSnapshot
 from fakuicode.permissions.manager import PermissionManager
 from fakuicode.permissions.models import DecisionKind, PermissionMode
 from fakuicode.permissions.safety import DangerousCommandGuard
-from fakuicode.tools.base import PreparedToolCall, Tool
+from fakuicode.tools.base import (
+    FINISH_AGENT_TURN,
+    FINISH_AGENT_TURN_MESSAGE,
+    PreparedToolCall,
+    Tool,
+)
 from fakuicode.tools.command import RunCommandTool
 from fakuicode.tools.filesystem import EditFileTool, FindFilesTool, ReadFileTool, SearchCodeTool, WriteFileTool
 from fakuicode.tools.policy import WorkspacePolicy
@@ -229,6 +234,29 @@ class ToolRegistry:
 
     def begin_request(self) -> None:
         self.permission_manager.begin_request()
+
+    def finish_turn_message(self, results: tuple[ToolResult, ...]) -> str | None:
+        """Honor deterministic completion only from successful host control tools."""
+
+        if not results:
+            return None
+        with self._lock:
+            system_names = frozenset(self._system_names)
+        messages: list[str] = []
+        for result in results:
+            metadata = result.metadata
+            if (
+                not result.success
+                or result.tool_name not in system_names
+                or metadata is None
+                or metadata.get(FINISH_AGENT_TURN) is not True
+            ):
+                return None
+            message = metadata.get(FINISH_AGENT_TURN_MESSAGE)
+            if not isinstance(message, str) or not message.strip():
+                return None
+            messages.append(message.strip())
+        return "\n".join(messages)
 
     def close(self) -> None:
         if self._owns_permission_manager:

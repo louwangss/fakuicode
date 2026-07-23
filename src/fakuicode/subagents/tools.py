@@ -15,6 +15,8 @@ from fakuicode.subagents.catalog import AgentCatalog
 from fakuicode.subagents.runtime import ChildRuntimeError, ChildRuntimeFactory
 from fakuicode.subagents.tasks import TaskManager, TaskManagerError, TaskSnapshot
 from fakuicode.tools.base import (
+    FINISH_AGENT_TURN,
+    FINISH_AGENT_TURN_MESSAGE,
     ToolExecution,
     ToolPreparation,
     freeze_arguments,
@@ -57,7 +59,8 @@ class AgentTool:
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             "agent",
-            "把一个边界明确的任务委派给独立子 Agent。subagent_type 留空表示 Fork 当前上下文。",
+            "把一个边界明确的任务委派给独立子 Agent。subagent_type 留空表示 Fork 当前上下文。"
+            "后台启动成功后当前轮会结束，任务完成时自动汇报；不要用 task_list 或 task_get 轮询等待。",
             {
                 "type": "object",
                 "properties": {
@@ -167,8 +170,14 @@ class AgentTool:
                     "mode": "background",
                     "status": "async_launched",
                     "task_id": task_id,
+                    "poll_again": False,
+                    "completion_notification": True,
                 },
                 "子 Agent 已在后台启动",
+                metadata=_finish_turn_metadata(
+                    f"子 Agent {session.name} 已在后台启动（{task_id}），"
+                    "完成后会自动汇报结果。"
+                ),
             )
         detach_event = Event()
         with self._inline_lock:
@@ -196,8 +205,14 @@ class AgentTool:
                     "mode": "background",
                     "status": "manually_backgrounded" if manual else "timed_out_to_background",
                     "task_id": task_id,
+                    "poll_again": False,
+                    "completion_notification": True,
                 },
                 "子 Agent 已转入后台",
+                metadata=_finish_turn_metadata(
+                    f"子 Agent {session.name} 已转入后台（{task_id}），"
+                    "完成后会自动汇报结果。"
+                ),
             )
         payload = {
             "ok": snapshot.status == "completed",
@@ -259,7 +274,8 @@ class TaskListTool:
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             "task_list",
-            "列出当前会话中的子 Agent 任务。",
+            "按需列出当前会话中的子 Agent 任务。后台任务完成时会自动汇报，"
+            "不要在同一轮反复调用本工具轮询等待。",
             {"type": "object", "properties": {}, "additionalProperties": False},
         )
 
@@ -287,7 +303,11 @@ class TaskGetTool:
 
     @property
     def definition(self) -> ToolDefinition:
-        return _task_id_definition("task_get", "读取一个子 Agent 任务的完整状态。")
+        return _task_id_definition(
+            "task_get",
+            "按需读取一个子 Agent 任务的当前状态或终态结果。若状态仍为 running、queued、"
+            "waiting_approval 或 cancelling，当前轮会结束并等待自动完成通知；不要轮询。",
+        )
 
     @property
     def read_only(self) -> bool:
@@ -308,8 +328,20 @@ class TaskGetTool:
         snapshot = self.manager.get(str(arguments["task_id"]))
         if snapshot is None:
             return _error("unknown_task", f"未知 task_id：{arguments['task_id']}")
+        task = _task_payload(snapshot, include_result=True)
+        if snapshot.status not in {"completed", "failed", "cancelled"}:
+            task["poll_again"] = False
+            task["completion_notification"] = True
+            return _success(
+                {"ok": True, "task": task},
+                "子 Agent 仍在后台运行",
+                metadata=_finish_turn_metadata(
+                    f"子 Agent {snapshot.name} 仍在后台运行（{snapshot.id}），"
+                    "完成后会自动汇报结果。"
+                ),
+            )
         return _success(
-            {"ok": True, "task": _task_payload(snapshot, include_result=True)},
+            {"ok": True, "task": task},
             "已读取子 Agent 任务",
         )
 
@@ -392,8 +424,14 @@ class SendMessageTool:
                 "mode": "background",
                 "status": "async_launched",
                 "task_id": task_id,
+                "poll_again": False,
+                "completion_notification": True,
             },
             "已向子 Agent 续派任务",
+            metadata=_finish_turn_metadata(
+                f"已向子 Agent {arguments['name']} 续派后台任务（{task_id}），"
+                "完成后会自动汇报结果。"
+            ),
         )
 
 
@@ -451,8 +489,20 @@ def _task_payload(snapshot: TaskSnapshot, *, include_result: bool) -> dict[str, 
     return payload
 
 
-def _success(payload: Mapping[str, object], summary: str) -> ToolExecution:
-    return ToolExecution(True, _json(payload), summary)
+def _success(
+    payload: Mapping[str, object],
+    summary: str,
+    *,
+    metadata: Mapping[str, object] | None = None,
+) -> ToolExecution:
+    return ToolExecution(True, _json(payload), summary, metadata=metadata)
+
+
+def _finish_turn_metadata(message: str) -> Mapping[str, object]:
+    return {
+        FINISH_AGENT_TURN: True,
+        FINISH_AGENT_TURN_MESSAGE: message,
+    }
 
 
 def _error(code: str, message: str) -> ToolExecution:

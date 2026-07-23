@@ -161,8 +161,41 @@ def test_agent_tool_background_launch_returns_before_result(tmp_path: Path) -> N
     assert payload["ok"] is True
     assert payload["mode"] == "background"
     assert payload["status"] == "async_launched"
+    assert result.metadata is not None
+    assert result.metadata["finish_agent_turn"] is True
+    assert payload["task_id"] in str(result.metadata["finish_agent_turn_message"])
     assert manager.wait(payload["task_id"], timeout=1) is not None
     assert manager.drain_notifications() == (payload["task_id"],)
+    manager.close()
+
+
+def test_task_get_running_result_finishes_turn_instead_of_inviting_polling(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.subagents.tasks import TaskManager
+    from fakuicode.subagents.tools import TaskGetTool
+
+    manager = TaskManager(max_concurrent=1)
+    session = BlockingSession("planner")
+    task_id = manager.launch(
+        session,
+        "make a plan",
+        "planning",
+        notify_on_done=True,
+    )
+    assert session.started.wait(timeout=1)
+
+    result = TaskGetTool(manager).execute({"task_id": task_id})
+    payload = json.loads(result.output)
+
+    assert payload["task"]["status"] == "running"
+    assert payload["task"]["poll_again"] is False
+    assert result.metadata is not None
+    assert result.metadata["finish_agent_turn"] is True
+    assert task_id in str(result.metadata["finish_agent_turn_message"])
+
+    session.release.set()
+    assert manager.wait(task_id, timeout=1) is not None
     manager.close()
 
 

@@ -357,6 +357,22 @@ class AgentRunner:
 
             history.append(AgentMessage("user", tool_results=tuple(results)))
             had_tool_results = True
+            finish_turn = getattr(self.tools, "finish_turn_message", None)
+            finish_message = (
+                finish_turn(tuple(results))
+                if callable(finish_turn)
+                else None
+            )
+            if isinstance(finish_message, str) and finish_message.strip():
+                # Start a synthetic final response so session persistence does
+                # not duplicate the assistant preamble that carried tool calls.
+                yield AgentStreamEvent(
+                    "progress",
+                    progress=AgentProgress(round_number, "model"),
+                )
+                yield AgentStreamEvent("text_delta", finish_message.strip())
+                yield AgentStreamEvent("completed")
+                return
             if round_number == self.max_iterations:
                 yield AgentStreamEvent("error", f"Agent stopped after reaching the {self.max_iterations}-round safety limit.")
                 return

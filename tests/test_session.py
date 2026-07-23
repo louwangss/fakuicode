@@ -177,6 +177,89 @@ def test_agent_session_injects_background_result_as_untrusted_user_data(
     assert request_messages[-1].content == "continue"
 
 
+def test_agent_session_persists_deferred_tool_receipt_without_preamble_duplication(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.models import AgentStreamEvent, ToolCall, ToolDefinition
+    from fakuicode.session import AgentSessionController
+    from fakuicode.storage import ConversationStore
+    from fakuicode.tools.base import ToolExecution, ToolPreparation, freeze_arguments
+    from fakuicode.tools.policy import WorkspacePolicy
+    from fakuicode.tools.registry import ToolRegistry
+
+    receipt = "子 Agent planner 已在后台启动（task-1），完成后会自动汇报结果。"
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stream_agent(self, messages, tools, *, cancel_event=None, request=None):
+            del messages, tools, cancel_event, request
+            self.calls += 1
+            yield AgentStreamEvent("text_delta", "正在启动子 Agent。")
+            yield AgentStreamEvent(
+                "tool_call",
+                tool_call=ToolCall("call-agent", "deferred_agent", {}),
+            )
+            yield AgentStreamEvent("completed")
+
+    class DeferredAgent:
+        @property
+        def definition(self) -> ToolDefinition:
+            return ToolDefinition(
+                "deferred_agent",
+                "launch deferred work",
+                {"type": "object", "properties": {}},
+            )
+
+        @property
+        def read_only(self) -> bool:
+            return True
+
+        def prepare(self, arguments):
+            return ToolPreparation(freeze_arguments(arguments), "deferred_agent")
+
+        def execute_prepared(self, arguments, *, cancel_event=None):
+            del arguments, cancel_event
+            return ToolExecution(
+                True,
+                '{"status":"async_launched"}',
+                "子 Agent 已在后台启动",
+                metadata={
+                    "finish_agent_turn": True,
+                    "finish_agent_turn_message": receipt,
+                },
+            )
+
+    store = ConversationStore(tmp_path / "history.sqlite3")
+    conversation = store.create_conversation("deferred", tmp_path, "default")
+    registry = ToolRegistry(WorkspacePolicy(tmp_path), tools=())
+    registry.register_system(DeferredAgent())
+    provider = Provider()
+    session = AgentSessionController(
+        provider,
+        registry,
+        store=store,
+        conversation_id=conversation.id,
+    )
+
+    events = list(session.send("launch"))
+
+    assert provider.calls == 1
+    assert [event.text for event in events if event.kind == "text_delta"] == [
+        "正在启动子 Agent。",
+        receipt,
+    ]
+    assert session.history[-1].role == "assistant"
+    assert session.history[-1].content == receipt
+    assistant_events = [
+        event.content
+        for event in store.load_events(conversation.id)
+        if event.kind == "assistant"
+    ]
+    assert assistant_events == ["正在启动子 Agent。", receipt]
+
+
 def test_agent_session_persists_and_restores_provider_state_for_tool_cycles(
     tmp_path: Path,
 ) -> None:

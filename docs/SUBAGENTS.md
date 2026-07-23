@@ -65,6 +65,8 @@ background: true
 
 后台并发默认上限为 2，同样是保守的本地资源默认值，不代表模型或 Provider 的官方限制。任务只在当前进程内存中存活，退出应用会请求取消全部任务。
 
+后台任务启动或续派成功后，主 Agent 当前轮会立即以确定性回执结束，不再调用 `task_list` / `task_get` 轮询。手动查询到 `running`、`queued`、`waiting_approval` 或 `cancelling` 时也会结束当前轮，等待完成通知；这样不会用空转的模型请求消耗 Agent Loop 轮数。
+
 任务完成后，TUI 会立即显示一个默认展开、可以用键盘折叠的结果块，标题固定包含子 Agent 名称、状态和完整 task ID；正文按纯文本显示，不能解释为 Rich markup。完整结果仍可通过 `task_get` 获取。
 
 同一结果也会以 `<task-notification>` 包装成不可信的 user-role 数据，在主 Agent 下一轮请求前注入；大结果沿用上下文产物外置机制。完成通知本身不会额外调用模型，也不会抢占正在进行的主对话。

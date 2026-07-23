@@ -1338,6 +1338,82 @@ def test_agent_runner_stops_at_the_iteration_limit_after_recording_the_last_resu
     assert "1-round safety limit" in events[-1].text
 
 
+def test_agent_runner_finishes_turn_after_deferred_system_tool_result() -> None:
+    from fakuicode.agent import AgentRunner
+    from fakuicode.models import (
+        AgentMessage,
+        AgentStreamEvent,
+        ToolCall,
+        ToolDefinition,
+        ToolResult,
+    )
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stream_agent(self, messages, tools, *, cancel_event=None, system_instruction=""):
+            del messages, tools, cancel_event, system_instruction
+            self.calls += 1
+            yield AgentStreamEvent(
+                "tool_call",
+                tool_call=ToolCall(
+                    f"call-{self.calls}",
+                    "agent",
+                    {"prompt": "plan", "description": "make a plan"},
+                ),
+            )
+            yield AgentStreamEvent("completed")
+
+    class Tools:
+        def definitions(self, *, read_only_only=False):
+            del read_only_only
+            return [ToolDefinition("agent", "delegate", {"type": "object"})]
+
+        def is_known(self, name):
+            return name == "agent"
+
+        def is_read_only(self, name):
+            del name
+            return False
+
+        def execute(self, call, *, cancel_event=None, read_only_only=False):
+            del cancel_event, read_only_only
+            return ToolResult(
+                call.id,
+                call.name,
+                True,
+                '{"status":"async_launched"}',
+                "子 Agent 已在后台启动",
+                metadata={
+                    "finish_agent_turn": True,
+                    "finish_agent_turn_message": (
+                        "子 Agent planner 已在后台启动（task-1），完成后会自动汇报结果。"
+                    ),
+                },
+            )
+
+        def finish_turn_message(self, results):
+            messages = [
+                str(result.metadata["finish_agent_turn_message"])
+                for result in results
+                if result.metadata is not None
+                and result.metadata.get("finish_agent_turn") is True
+            ]
+            return "\n".join(messages) if len(messages) == len(results) else None
+
+    provider = Provider()
+    events = list(
+        AgentRunner(provider, Tools(), max_iterations=3).run(
+            [AgentMessage("user", "launch a planner")]
+        )
+    )
+
+    assert provider.calls == 1
+    assert [event.kind for event in events][-2:] == ["text_delta", "completed"]
+    assert "完成后会自动汇报结果" in events[-2].text
+
+
 def test_agent_runner_allows_more_than_twelve_rounds_by_default() -> None:
     from fakuicode.agent import AgentRunner
     from fakuicode.models import AgentMessage, AgentStreamEvent, ToolCall, ToolDefinition, ToolResult
