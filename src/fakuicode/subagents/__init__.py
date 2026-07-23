@@ -13,6 +13,7 @@ from fakuicode.subagents.runtime import (
     ChildRuntimeError,
     ChildRuntimeFactory,
 )
+from fakuicode.subagents.tasks import TaskManager, TaskManagerError, TaskSnapshot
 
 __all__ = [
     "AgentCatalog",
@@ -25,4 +26,7 @@ __all__ = [
     "ChildRuntimeError",
     "ChildRuntimeFactory",
     "PermissionBehavior",
+    "TaskManager",
+    "TaskManagerError",
+    "TaskSnapshot",
 ]
