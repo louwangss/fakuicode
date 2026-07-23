@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections import deque
 
-from rich.columns import Columns
+from rich.console import Console, ConsoleOptions, Group, RenderResult
+from rich.measure import Measurement
 from rich.style import Style
+from rich.table import Column, Table
 from rich.text import Text
 from textual import events, on
 from textual.app import ComposeResult
@@ -71,6 +73,38 @@ def _render_brand_logo() -> Text:
     return logo
 
 
+class _BrandLayout:
+    """Keep brand metadata close to the logo without wasting narrow-screen rows."""
+
+    _COLUMN_GAP = 3
+
+    def __init__(self, information: Text, logo: Text) -> None:
+        self._information = information
+        self._logo = logo
+
+    def __rich_console__(
+        self,
+        console: Console,
+        options: ConsoleOptions,
+    ) -> RenderResult:
+        logo_width = Measurement.get(console, options, self._logo).maximum
+        information_width = Measurement.get(console, options, self._information).maximum
+        required_width = logo_width + self._COLUMN_GAP + information_width
+
+        if required_width <= options.max_width:
+            layout = Table.grid(
+                Column(width=logo_width, no_wrap=True),
+                Column(width=information_width, vertical="middle"),
+                padding=(0, self._COLUMN_GAP),
+                expand=False,
+            )
+            layout.add_row(self._logo, self._information)
+            yield layout
+            return
+
+        yield Group(self._information, self._logo)
+
+
 class BrandPanel(Static):
     """Responsive local-only application identity and configuration summary."""
 
@@ -87,16 +121,9 @@ class BrandPanel(Static):
         )
         self._brand_logo = _render_brand_logo()
 
-    def render(self) -> Columns:
+    def render(self) -> _BrandLayout:
         """Place the full logo beside metadata when wide and below it when narrow."""
-        return Columns(
-            (self._brand_information, self._brand_logo),
-            padding=(0, 2),
-            expand=True,
-            equal=False,
-            column_first=True,
-            right_to_left=True,
-        )
+        return _BrandLayout(self._brand_information, self._brand_logo)
 
 
 class ConversationView(VerticalScroll):

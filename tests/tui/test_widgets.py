@@ -98,14 +98,23 @@ def test_brand_panel_keeps_literal_metadata_without_sensitive_configuration() ->
     assert "tool" not in visible.lower()
 
 
-def test_brand_panel_places_logo_left_of_information_when_wide() -> None:
+def test_brand_panel_places_information_close_to_and_centered_on_logo_when_wide() -> None:
     lines = _brand_render_lines(100)
-    title_row = next(index for index, line in enumerate(lines) if "Fakuicode" in _rendered_line_text(line))
-    title_line = _rendered_line_text(lines[title_row])
-    colored_columns = _colored_columns(lines[title_row])
+    visible_lines = [_rendered_line_text(line) for line in lines]
+    title_row = next(index for index, line in enumerate(visible_lines) if "Fakuicode" in line)
+    model_row = next(index for index, line in enumerate(visible_lines) if "claude-test[bold]" in line)
+    directory_row = next(
+        index
+        for index, line in enumerate(visible_lines)
+        if r"C:\Users\example\Desktop\fakuicode\[literal]" in line
+    )
+    colored_rows = [index for index, line in enumerate(lines) if _colored_columns(line)]
 
-    assert colored_columns
-    assert min(colored_columns) < title_line.index("Fakuicode")
+    assert colored_rows == list(range(8))
+    assert (title_row, model_row, directory_row) == (2, 3, 4)
+    assert visible_lines[title_row].index("Fakuicode") == 27
+    assert visible_lines[model_row].index("claude-test[bold]") == 27
+    assert visible_lines[directory_row].index(r"C:\Users\example") == 27
 
 
 def test_brand_panel_stacks_information_above_complete_logo_when_narrow() -> None:
