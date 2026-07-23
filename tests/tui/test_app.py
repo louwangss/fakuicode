@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator, Sequence
+from io import StringIO
 from pathlib import Path
 from threading import Event
 from time import sleep
 
 import pytest
+from rich.console import Console
 from textual.widgets import Collapsible, Footer, Header, Markdown, OptionList, Static
+
+
+def render_plain(renderable: object, *, width: int = 120) -> str:
+    console = Console(width=width, record=True, file=StringIO())
+    console.print(renderable)
+    return console.export_text()
 
 
 class FakeProvider:
@@ -725,7 +733,7 @@ def test_app_renders_chrome_streaming_thinking_and_final_markdown() -> None:
             assert list(app.query(Footer)) == []
             brand = app.query_one(BrandPanel)
             prompt_panel = app.query_one(PromptPanel)
-            brand_text = brand.render().plain
+            brand_text = render_plain(brand.render())
             status = app.query_one("#status", Static)
             footer_model = app.query_one("#footer-model", Static).render().plain
             assert "Fakuicode v0.1.0" in brand_text
@@ -2569,8 +2577,9 @@ def test_chrome_hides_the_protocol_and_keeps_model_in_input_information_row() ->
             await pilot.pause()
             brand = app.query_one(BrandPanel)
             prompt_panel = app.query_one(PromptPanel)
-            assert "claude-test" in brand.render().plain
-            assert "ANTHROPIC" not in brand.render().plain
+            brand_text = render_plain(brand.render())
+            assert "claude-test" in brand_text
+            assert "ANTHROPIC" not in brand_text
             assert prompt_panel.query_one("#footer-model", Static).render().plain == "claude-test"
             assert prompt_panel.query_one("#status", Static).region.y > app.query_one(PromptEditor).region.y
 

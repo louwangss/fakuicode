@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 
+from rich.columns import Columns
 from rich.style import Style
 from rich.text import Text
 from textual import events, on
@@ -19,19 +20,80 @@ from fakuicode.models import ProviderConfig, ToolCall, ToolResult
 
 APP_VERSION = "0.1.0"
 
+_BRAND_LOGO_GRID = (
+    "................................DDD",
+    "................DDDD...........DRRD",
+    "..............DRRRRRRRRRDDDD..DRDD.",
+    "............DRRRRRRRRRDDDD..DDRD...",
+    "...........DRRRDDDDGGR.....DRDD....",
+    "..........DDDDDDDDRRRD....DRD......",
+    "...............RRRRDDRRRDDRD.......",
+    "...............RRRDDDDRRRRRRRDDD...",
+    "...............RDDDDD.DDDRRRRRRDDD.",
+    "...............DDDDDDRRDDDDRRRRRDDD",
+    "................DDDDDD..DD.DDDDRDDD",
+    "...............DDDRDD....DD....DDD.",
+    "..............DDDRDDD....DD........",
+    ".............DDDRDDDDD...DD........",
+    "............DRDD.DD.DD..DDD........",
+    "...........DRDD..DD..DD.DDD........",
+    "..........DRDD..DD...DD............",
+    "........DDRD....DD....DD...........",
+    "......DDRRD....DDD....DDD..........",
+    ".....DDRD......DD......DD..........",
+    "...DRGDD......DDD......DDD.........",
+    "..DGGRD.......DDD.......DDD........",
+    ".DGGD........DRRD.......DRD........",
+    "DDD.........DDRDD........DRDD......",
+)
+_BRAND_LOGO_COLORS = {
+    "R": "#ef4444",
+    "D": "#7f1d1d",
+    "G": "#d1d5db",
+}
+
+
+def _render_brand_logo() -> Text:
+    """Render the confirmed logo grid with portable background-color cells."""
+    logo = Text()
+    styles = {
+        marker: Style(bgcolor=color)
+        for marker, color in _BRAND_LOGO_COLORS.items()
+    }
+    for row_index, row in enumerate(_BRAND_LOGO_GRID):
+        for marker in row:
+            logo.append(" ", style=styles.get(marker))
+        if row_index < len(_BRAND_LOGO_GRID) - 1:
+            logo.append("\n")
+    return logo
+
 
 class BrandPanel(Static):
-    """Compact, local-only application identity and configuration summary."""
+    """Responsive local-only application identity and configuration summary."""
 
     def __init__(self, config: ProviderConfig, working_directory: str) -> None:
-        content = "\n".join(
-            (
-                f" /\\_/\\    Fakuicode v{APP_VERSION}",
-                f"( o.o )   {config.model}",
-                f" > ^ <    {working_directory}",
+        super().__init__(id="brand-panel")
+        self._brand_information = Text(
+            "\n".join(
+                (
+                    f"Fakuicode v{APP_VERSION}",
+                    config.model,
+                    working_directory,
+                )
             )
         )
-        super().__init__(Text(content), id="brand-panel")
+        self._brand_logo = _render_brand_logo()
+
+    def render(self) -> Columns:
+        """Place the full logo beside metadata when wide and below it when narrow."""
+        return Columns(
+            (self._brand_information, self._brand_logo),
+            padding=(0, 2),
+            expand=True,
+            equal=False,
+            column_first=True,
+            right_to_left=True,
+        )
 
 
 class ConversationView(VerticalScroll):
