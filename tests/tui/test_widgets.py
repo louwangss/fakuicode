@@ -237,3 +237,29 @@ def test_tool_activity_cycles_completions_in_place() -> None:
             assert "Done" in activity.render().plain
 
     asyncio.run(run())
+
+
+def test_subagent_result_notice_uses_error_when_no_result_text_exists() -> None:
+    async def run() -> None:
+        from textual.app import App, ComposeResult
+
+        from fakuicode.tui.widgets import SubagentResultNotice
+
+        class WidgetApp(App[None]):
+            def compose(self) -> ComposeResult:
+                yield SubagentResultNotice(
+                    task_id="task-failed",
+                    name="reviewer",
+                    status="failed",
+                    result="",
+                    error="权限被拒绝",
+                )
+
+        app = WidgetApp()
+        async with app.run_test():
+            report = app.query_one(SubagentResultNotice)
+            assert "失败" in report.title
+            assert "task-failed" in report.title
+            assert report.result_body.render().plain == "权限被拒绝"
+
+    asyncio.run(run())

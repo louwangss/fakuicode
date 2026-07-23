@@ -347,6 +347,43 @@ class SystemNotice(Static):
         super().__init__(Text(content), classes="system-notice")
 
 
+class SubagentResultNotice(Collapsible):
+    """A deterministic, keyboard-accessible report for one background result."""
+
+    _STATUS_LABELS = {
+        "completed": "已完成",
+        "failed": "失败",
+        "cancelled": "已取消",
+    }
+
+    def __init__(
+        self,
+        *,
+        task_id: str,
+        name: str,
+        status: str,
+        result: str,
+        error: str | None,
+    ) -> None:
+        self.task_id = task_id
+        self.agent_name = name
+        self.task_status = status
+        body = result.strip()
+        if not body:
+            body = (error or "子 Agent 没有返回文本。").strip()
+        self.result_body = Static(
+            Text(body),
+            classes="subagent-result-body",
+        )
+        label = self._STATUS_LABELS.get(status, status)
+        super().__init__(
+            self.result_body,
+            title=f"SubAgent {name} · {label} · {task_id}",
+            collapsed=False,
+            classes=f"subagent-result subagent-result-{status}",
+        )
+
+
 class AssistantTurn(Vertical):
     """One assistant response, from literal stream text to final Markdown."""
 

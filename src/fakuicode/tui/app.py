@@ -110,7 +110,16 @@ from fakuicode.tui.permission_prompt import (
     PermissionSettingsScreen,
     PlanExecutionPrompt,
 )
-from fakuicode.tui.widgets import AssistantTurn, BrandPanel, ConversationView, PromptEditor, PromptPanel, SystemNotice, UserMessage
+from fakuicode.tui.widgets import (
+    AssistantTurn,
+    BrandPanel,
+    ConversationView,
+    PromptEditor,
+    PromptPanel,
+    SubagentResultNotice,
+    SystemNotice,
+    UserMessage,
+)
 
 
 _RESUME_GAP_NS = 24 * 60 * 60 * 1_000_000_000
@@ -1848,7 +1857,19 @@ class FakuicodeApp(App[None]):
                 result=snapshot.result,
                 error=snapshot.error,
             )
-            self._notice(f"SubAgent {snapshot.name} · {snapshot.status}")
+            self.query_one("#conversation", VerticalScroll).mount(
+                SubagentResultNotice(
+                    task_id=snapshot.id,
+                    name=snapshot.name,
+                    status=snapshot.status,
+                    result=snapshot.result,
+                    error=snapshot.error,
+                )
+            )
+            self._set_status(
+                f"SubAgent {snapshot.name} · {snapshot.status} · {snapshot.id}"
+            )
+            self._schedule_stream_follow()
 
     @on(PlanExecutionPrompt.Resolved)
     def _resolve_plan_execution(self, message: PlanExecutionPrompt.Resolved) -> None:

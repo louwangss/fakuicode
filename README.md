@@ -71,7 +71,7 @@ Skill 把可重复的 SOP 保存为目录型能力包。项目、用户和内置
 
 主 Agent 可以通过稳定的 `agent` 工具把边界明确的任务交给独立子 Agent。指定 `subagent_type` 时从空白上下文启动预定义角色；省略时从父 Agent 最近一次成功请求 Fork，并强制在后台运行。后台任务可通过 `task_list`、`task_get`、`task_stop` 和 `send_message` 查询、停止与续派；前台子 Agent 运行时按 Esc 或 Ctrl+B 可转入后台。角色格式、加载优先级、权限与缓存边界见 [SubAgent 文档](docs/SUBAGENTS.md)。
 
-子 Agent 不会看到 `agent`、任务控制和 Skill 管理工具，因此不能递归委派。它拥有独立消息、权限决策状态、上下文管理和 token 计数，但共享 Provider 传输、文件系统与主 TUI 审批入口。后台结果在下一轮以不可信数据注入模型上下文，完整结果也可通过 `task_get` 读取；不会冒充 system 指令。
+子 Agent 不会看到 `agent`、任务控制和 Skill 管理工具，因此不能递归委派。它拥有独立消息、权限决策状态、上下文管理和 token 计数，但共享 Provider 传输、文件系统与主 TUI 审批入口。后台任务完成时，TUI 会展示包含 task ID 的可折叠纯文本结果；同一结果在下一轮以不可信数据注入模型上下文，也可通过 `task_get` 读取，不会冒充 system 指令。
 
 ### 自动记忆与会话连续性
 
