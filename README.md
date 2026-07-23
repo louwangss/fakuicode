@@ -67,6 +67,12 @@ Skill 把可重复的 SOP 保存为目录型能力包。项目、用户和内置
 
 `visible-tools` 只收窄模型本轮可见和可执行的工具集合，不等于权限放行。项目 Skill 中的 Python 脚本必须按完整能力包指纹确认信任，之后每次调用仍需经过普通权限系统；脚本进程使用 `shell=False`，但不具备容器或操作系统级沙箱。
 
+### 子 Agent
+
+主 Agent 可以通过稳定的 `agent` 工具把边界明确的任务交给独立子 Agent。指定 `subagent_type` 时从空白上下文启动预定义角色；省略时从父 Agent 最近一次成功请求 Fork，并强制在后台运行。后台任务可通过 `task_list`、`task_get`、`task_stop` 和 `send_message` 查询、停止与续派；前台子 Agent 运行时按 Esc 或 Ctrl+B 可转入后台。角色格式、加载优先级、权限与缓存边界见 [SubAgent 文档](docs/SUBAGENTS.md)。
+
+子 Agent 不会看到 `agent`、任务控制和 Skill 管理工具，因此不能递归委派。它拥有独立消息、权限决策状态、上下文管理和 token 计数，但共享 Provider 传输、文件系统与主 TUI 审批入口。后台结果在下一轮以不可信数据注入模型上下文，完整结果也可通过 `task_get` 读取；不会冒充 system 指令。
+
 ### 自动记忆与会话连续性
 
 自动记忆默认开启。首次启动会说明：完成的执行轮次可由当前模型在后台提取精炼笔记，笔记只保存在本机 `~/.fakuicode/memory/`，可随时用 `/memory off` 关闭。用户级偏好与当前项目知识分开存放；项目身份按经验证的 Git common-dir 或非 Git 实际路径隔离，不会写入工作区或提交到 Git。

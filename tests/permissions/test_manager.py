@@ -239,6 +239,24 @@ def test_child_permission_state_copies_parent_rules_without_sharing_mutations(tm
     assert len(parent.session_rules) == 1
 
 
+def test_child_observes_parent_rules_approved_after_spawn(tmp_path: Path) -> None:
+    parent_handler = RecordingApprovalHandler(ApprovalChoice.SESSION)
+    parent = _manager(tmp_path, parent_handler)
+    child_handler = RecordingApprovalHandler(ApprovalChoice.DENY)
+    child = parent.spawn_child(approval_handler=child_handler)
+    prepared = _prepared(target="src/shared.py")
+
+    assert parent.authorize(prepared).kind is DecisionKind.ALLOW
+    inherited = child.authorize(
+        _prepared(target="src/shared.py", call_id="child-late-rule")
+    )
+
+    assert inherited.kind is DecisionKind.ALLOW
+    assert inherited.layer == "parent_ledger"
+    assert child_handler.requests == []
+    assert child.session_rules == ()
+
+
 def test_child_permission_mode_cannot_elevate_parent_mode(tmp_path: Path) -> None:
     parent = _manager(
         tmp_path,

@@ -46,6 +46,12 @@ class FakeSession:
         self.cancel()
 
 
+class CrashingSession(FakeSession):
+    def run_to_completion(self, prompt: str, *, event_sink=None) -> ChildRunResult:
+        del prompt, event_sink
+        raise RuntimeError("secret provider failure")
+
+
 def test_task_manager_tracks_completion_and_keeps_session_for_followup() -> None:
     from fakuicode.subagents.tasks import TaskManager
 
@@ -103,4 +109,70 @@ def test_task_manager_wait_timeout_detaches_without_restarting_task() -> None:
 
     assert finished is not None and finished.status == "completed"
     assert session.prompts == ["slow work"]
+    manager.close()
+
+
+def test_task_manager_only_notifies_for_backgrounded_runs() -> None:
+    from fakuicode.subagents.tasks import TaskManager
+
+    manager = TaskManager(max_concurrent=1)
+    inline_id = manager.launch(FakeSession("inline"), "one", "inline")
+    assert manager.wait(inline_id, timeout=1) is not None
+    assert manager.drain_notifications() == ()
+
+    background_id = manager.launch(
+        FakeSession("background"),
+        "two",
+        "background",
+        notify_on_done=True,
+    )
+    assert manager.wait(background_id, timeout=1) is not None
+    assert manager.drain_notifications() == (background_id,)
+
+    late_id = manager.launch(FakeSession("late"), "three", "late")
+    assert manager.wait(late_id, timeout=1) is not None
+    manager.mark_background(late_id)
+    assert manager.drain_notifications() == (late_id,)
+    manager.close()
+
+
+def test_later_idle_session_replaces_the_same_name_for_followup() -> None:
+    from fakuicode.subagents.tasks import TaskManager
+
+    manager = TaskManager(max_concurrent=1)
+    first = FakeSession("review")
+    first_id = manager.launch(first, "first", "first")
+    assert manager.wait(first_id, timeout=1) is not None
+
+    replacement = FakeSession("review")
+    replacement.id = "session-review-replacement"
+    second_id = manager.launch(replacement, "second", "second")
+    assert manager.wait(second_id, timeout=1) is not None
+
+    followup_id = manager.send_message("review", "follow up")
+    assert manager.wait(followup_id, timeout=1) is not None
+    assert first.prompts == ["first"]
+    assert replacement.prompts == ["second", "follow up"]
+    manager.close()
+
+
+def test_background_crash_is_contained_and_notified_without_leaking_exception(
+) -> None:
+    from fakuicode.subagents.tasks import TaskManager
+
+    manager = TaskManager(max_concurrent=1)
+    task_id = manager.launch(
+        CrashingSession("crash"),
+        "explode",
+        "crashing task",
+        notify_on_done=True,
+    )
+
+    snapshot = manager.wait(task_id, timeout=1)
+    assert snapshot is not None
+    assert snapshot.status == "failed"
+    assert snapshot.result == ""
+    assert snapshot.error == "子 Agent 运行时发生内部错误"
+    assert "secret provider failure" not in snapshot.error
+    assert manager.drain_notifications() == (task_id,)
     manager.close()

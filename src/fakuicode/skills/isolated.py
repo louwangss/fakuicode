@@ -14,6 +14,7 @@ from fakuicode.session import AgentSessionController
 from fakuicode.skills.models import SkillDefinition
 from fakuicode.skills.tool import SkillScriptTool
 from fakuicode.storage import ConversationStore
+from fakuicode.subagents.runtime import run_controller_to_completion
 from fakuicode.tools.base import ToolExecution
 from fakuicode.tools.registry import ToolRegistry
 
@@ -106,7 +107,6 @@ class IsolatedSkillExecutor:
                 "status": "active",
             },
         )
-        response: list[str] = []
         terminal = "error"
         session: AgentSessionController | None = None
         try:
@@ -137,21 +137,13 @@ class IsolatedSkillExecutor:
             for message in inherited:
                 self._append_inherited_message(child.id, message)
             session.history = list(session.context_manager.active_messages())
-            for event in session.send(
+            outcome = run_controller_to_completion(
+                session,
                 f"执行 Skill '{skill.name}'。参数已在 Skill 指令中提供。",
                 cancel_event=cancel_event,
-            ):
-                if event.kind == "progress" and event.progress is not None and event.progress.phase == "model":
-                    response = []
-                elif event.kind == "text_delta":
-                    response.append(event.text)
-                elif event.kind == "completed":
-                    terminal = "completed"
-                elif event.kind == "cancelled":
-                    terminal = "cancelled"
-                elif event.kind == "error":
-                    terminal = "error"
-            answer = "".join(response).strip()
+            )
+            terminal = "error" if outcome.status == "failed" else outcome.status
+            answer = outcome.text
             if terminal == "completed" and answer:
                 return ToolExecution(
                     True,

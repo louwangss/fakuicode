@@ -1437,7 +1437,17 @@ def test_app_cycles_read_only_activity_in_one_line_and_keeps_the_final_answer() 
                     )
                 else:
                     assert [definition.name for definition in tools] == [
-                        "read_file", "write_file", "edit_file", "run_command", "find_files", "search_code"
+                        "read_file",
+                        "write_file",
+                        "edit_file",
+                        "run_command",
+                        "find_files",
+                        "search_code",
+                        "agent",
+                        "task_list",
+                        "task_get",
+                        "task_stop",
+                        "send_message",
                     ]
                     yield AgentStreamEvent("text_delta", "README.md is available at the workspace root.")
                 yield AgentStreamEvent("completed")

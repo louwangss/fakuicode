@@ -70,6 +70,7 @@ TimelineEventKind = Literal[
     "context_diagnostic",
     "hook_diagnostic",
     "skill_activation",
+    "agent_result",
     "system",
 ]
 

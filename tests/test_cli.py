@@ -98,8 +98,9 @@ def test_default_cli_creates_its_private_conversation_store(tmp_path, monkeypatc
             memory_service,
             provider_factory,
             skill_user_root,
+            agent_user_root,
             skill_trust_repository,
-        ) -> None:
+            ) -> None:
             self.ran = False
             assert store is not None
             assert profile_name == "fast"
@@ -116,6 +117,7 @@ def test_default_cli_creates_its_private_conversation_store(tmp_path, monkeypatc
             captured["memory_service"] = memory_service
             captured["provider_factory"] = provider_factory
             captured["skill_user_root"] = skill_user_root
+            captured["agent_user_root"] = agent_user_root
             captured["skill_trust_repository"] = skill_trust_repository
 
         def run(self) -> None:

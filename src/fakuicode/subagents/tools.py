@@ -6,6 +6,8 @@ from collections.abc import Mapping
 import json
 import re
 from threading import Event
+from threading import RLock
+from time import monotonic
 
 from fakuicode.errors import ToolExecutionError
 from fakuicode.models import ToolDefinition
@@ -47,6 +49,9 @@ class AgentTool:
         self.manager = manager
         self.inline_timeout_seconds = inline_timeout_seconds
         self.background_enabled = background_enabled
+        self._inline_lock = RLock()
+        self._inline_task_id: str | None = None
+        self._detach_event: Event | None = None
 
     @property
     def definition(self) -> ToolDefinition:
@@ -116,30 +121,42 @@ class AgentTool:
         cancel_event: Event | None = None,
     ) -> ToolExecution:
         role = arguments.get("subagent_type")
-        if not isinstance(role, str):
-            return _error("fork_unavailable", "Fork 路径尚未就绪")
+        is_fork = not isinstance(role, str)
+        if is_fork and arguments.get("profile") not in {None, "inherit"}:
+            return _error("fork_profile_override", "Fork 必须继承父 Agent 的 Profile")
+        definition = None
+        if not is_fork:
+            try:
+                definition = self.catalog.resolve(role)
+            except KeyError:
+                return _error("unknown_subagent_type", f"未知 subagent_type: {role}")
+        if is_fork and not self.background_enabled:
+            return _error("background_disabled", "后台任务已禁用，无法 Fork")
         try:
-            definition = self.catalog.resolve(role)
-        except KeyError:
-            return _error("unknown_subagent_type", f"未知 subagent_type: {role}")
-        try:
-            session = self.runtime_factory.create_defined(
-                definition,
-                profile_override=(
-                    str(arguments["profile"])
-                    if arguments.get("profile") not in {None, "inherit"}
-                    else None
-                ),
-                name=str(arguments["name"]) if "name" in arguments else None,
+            if is_fork:
+                session = self.runtime_factory.create_fork(
+                    name=str(arguments["name"]) if "name" in arguments else None,
+                )
+            else:
+                assert definition is not None
+                session = self.runtime_factory.create_defined(
+                    definition,
+                    profile_override=(
+                        str(arguments["profile"])
+                        if arguments.get("profile") not in {None, "inherit"}
+                        else None
+                    ),
+                    name=str(arguments["name"]) if "name" in arguments else None,
+                )
+            requested_background = is_fork or bool(arguments.get("run_in_background")) or (
+                definition.background if definition is not None else False
             )
-            background = bool(arguments.get("run_in_background")) or definition.background
-            if background and not self.background_enabled:
-                session.close(status="cancelled")
-                return _error("background_disabled", "后台任务已禁用")
+            background = requested_background and self.background_enabled
             task_id = self.manager.launch(
                 session,
                 str(arguments["prompt"]),
                 str(arguments["description"]),
+                notify_on_done=background,
             )
         except (ChildRuntimeError, TaskManagerError) as error:
             return _error("launch_failed", str(error))
@@ -153,23 +170,34 @@ class AgentTool:
                 },
                 "子 Agent 已在后台启动",
             )
-        snapshot = self.manager.wait(
-            task_id,
-            timeout=self.inline_timeout_seconds,
-            cancel_event=cancel_event,
-        )
+        detach_event = Event()
+        with self._inline_lock:
+            self._inline_task_id = task_id
+            self._detach_event = detach_event
+        try:
+            snapshot = self._wait_inline(
+                task_id,
+                detach_event=detach_event,
+                cancel_event=cancel_event,
+            )
+        finally:
+            with self._inline_lock:
+                self._inline_task_id = None
+                self._detach_event = None
         if snapshot is None:
             if not self.background_enabled:
                 self.manager.stop(task_id)
                 return _error("inline_timeout", "子 Agent 前台执行超时且后台任务已禁用")
+            self.manager.mark_background(task_id)
+            manual = detach_event.is_set()
             return _success(
                 {
                     "ok": True,
                     "mode": "background",
-                    "status": "timed_out_to_background",
+                    "status": "manually_backgrounded" if manual else "timed_out_to_background",
                     "task_id": task_id,
                 },
-                "子 Agent 已自动转入后台",
+                "子 Agent 已转入后台",
             )
         payload = {
             "ok": snapshot.status == "completed",
@@ -185,6 +213,42 @@ class AgentTool:
             _json(payload),
             "子 Agent 已完成" if snapshot.status == "completed" else "子 Agent 未成功完成",
         )
+
+    def background_current(self) -> bool:
+        if not self.background_enabled:
+            return False
+        with self._inline_lock:
+            if self._inline_task_id is None or self._detach_event is None:
+                return False
+            self._detach_event.set()
+            return True
+
+    def _wait_inline(
+        self,
+        task_id: str,
+        *,
+        detach_event: Event,
+        cancel_event: Event | None,
+    ):
+        deadline = monotonic() + self.inline_timeout_seconds
+        while True:
+            snapshot = self.manager.get(task_id)
+            if snapshot is None:
+                raise TaskManagerError(f"未知 task_id：{task_id}")
+            if snapshot.status in {"completed", "failed", "cancelled"}:
+                return snapshot
+            if detach_event.is_set():
+                return None
+            if cancel_event is not None and cancel_event.is_set():
+                self.manager.stop(task_id)
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return None
+            self.manager.wait(
+                task_id,
+                timeout=min(0.05, remaining),
+                cancel_event=cancel_event,
+            )
 
 
 class TaskListTool:
@@ -401,4 +465,3 @@ def _error(code: str, message: str) -> ToolExecution:
 
 def _json(payload: Mapping[str, object]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-

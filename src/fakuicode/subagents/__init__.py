@@ -12,6 +12,7 @@ from fakuicode.subagents.runtime import (
     ChildRunResult,
     ChildRuntimeError,
     ChildRuntimeFactory,
+    run_controller_to_completion,
 )
 from fakuicode.subagents.tasks import TaskManager, TaskManagerError, TaskSnapshot
 
@@ -25,6 +26,7 @@ __all__ = [
     "ChildRunResult",
     "ChildRuntimeError",
     "ChildRuntimeFactory",
+    "run_controller_to_completion",
     "PermissionBehavior",
     "TaskManager",
     "TaskManagerError",

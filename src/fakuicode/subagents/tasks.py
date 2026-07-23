@@ -61,6 +61,7 @@ class TaskSnapshot:
     last_activity: str
     conversation_id: str
     profile_name: str
+    notify_on_done: bool
 
 
 @dataclass
@@ -77,6 +78,7 @@ class _TaskRun:
     usage: TokenUsage | None = None
     tool_count: int = 0
     last_activity: str = ""
+    notify_on_done: bool = False
 
 
 class TaskManager:
@@ -91,6 +93,7 @@ class TaskManager:
         self._sessions: dict[str, ManagedChildSession] = {}
         self._names: dict[str, str] = {}
         self._done: SimpleQueue[str] = SimpleQueue()
+        self._notifications: SimpleQueue[str] = SimpleQueue()
         self._lock = RLock()
         self._changed = Condition(self._lock)
         self._closed = False
@@ -100,6 +103,8 @@ class TaskManager:
         session: ManagedChildSession,
         prompt: str,
         description: str,
+        *,
+        notify_on_done: bool = False,
     ) -> str:
         if not prompt.strip() or not description.strip():
             raise TaskManagerError("任务 prompt 和 description 不能为空")
@@ -108,16 +113,29 @@ class TaskManager:
                 raise TaskManagerError("后台任务管理器已经关闭")
             existing_session_id = self._names.get(session.name)
             if existing_session_id is not None and existing_session_id != session.id:
-                raise TaskManagerError(f"Agent 名称 '{session.name}' 已被占用")
+                if any(
+                    task.session.id == existing_session_id
+                    and task.status not in _TERMINAL
+                    for task in self._tasks.values()
+                ):
+                    raise TaskManagerError(f"Agent 名称 '{session.name}' 已被占用")
             if any(
                 task.session.id == session.id and task.status not in _TERMINAL
                 for task in self._tasks.values()
             ):
                 raise TaskManagerError(f"Agent '{session.name}' 已有任务正在运行")
             self._sessions[session.id] = session
+            # The name is intentionally a weak routing reference: a later idle
+            # session with the same name becomes the SendMessage target.
             self._names[session.name] = session.id
             task_id = f"task-{uuid4()}"
-            task = _TaskRun(task_id, session, prompt.strip(), description.strip())
+            task = _TaskRun(
+                task_id,
+                session,
+                prompt.strip(),
+                description.strip(),
+                notify_on_done=notify_on_done,
+            )
             self._tasks[task_id] = task
             self._executor.submit(self._run, task_id)
             self._changed.notify_all()
@@ -129,7 +147,12 @@ class TaskManager:
             session = self._sessions.get(session_id) if session_id is not None else None
         if session is None:
             raise TaskManagerError(f"找不到仍存活的 Agent：{name}")
-        return self.launch(session, message, f"续派给 {name}")
+        return self.launch(
+            session,
+            message,
+            f"续派给 {name}",
+            notify_on_done=True,
+        )
 
     def get(self, task_id: str) -> TaskSnapshot | None:
         with self._lock:
@@ -183,11 +206,62 @@ class TaskManager:
             self._changed.notify_all()
             return True
 
+    def stop_by_name(self, name: str) -> bool:
+        with self._lock:
+            task = next(
+                (
+                    item
+                    for item in reversed(tuple(self._tasks.values()))
+                    if item.session.name == name and item.status not in _TERMINAL
+                ),
+                None,
+            )
+        return self.stop(task.id) if task is not None else False
+
+    def mark_waiting_approval(self, name: str, waiting: bool) -> bool:
+        with self._changed:
+            task = next(
+                (
+                    item
+                    for item in reversed(tuple(self._tasks.values()))
+                    if item.session.name == name and item.status not in _TERMINAL
+                ),
+                None,
+            )
+            if task is None:
+                return False
+            if waiting and task.status == "running":
+                task.status = "waiting_approval"
+            elif not waiting and task.status == "waiting_approval":
+                task.status = "running"
+            self._changed.notify_all()
+            return True
+
+    def mark_background(self, task_id: str) -> None:
+        with self._changed:
+            task = self._tasks.get(task_id)
+            if task is None:
+                raise TaskManagerError(f"未知 task_id：{task_id}")
+            if task.notify_on_done:
+                return
+            task.notify_on_done = True
+            if task.status in _TERMINAL:
+                self._notifications.put(task.id)
+            self._changed.notify_all()
+
     def drain_done(self) -> tuple[str, ...]:
         items: list[str] = []
         while True:
             try:
                 items.append(self._done.get_nowait())
+            except Empty:
+                return tuple(items)
+
+    def drain_notifications(self) -> tuple[str, ...]:
+        items: list[str] = []
+        while True:
+            try:
+                items.append(self._notifications.get_nowait())
             except Empty:
                 return tuple(items)
 
@@ -253,6 +327,8 @@ class TaskManager:
 
     def _finish(self, task: _TaskRun) -> None:
         self._done.put(task.id)
+        if task.notify_on_done:
+            self._notifications.put(task.id)
         self._changed.notify_all()
 
 
@@ -273,5 +349,5 @@ def _snapshot(task: _TaskRun) -> TaskSnapshot:
         task.last_activity,
         task.session.conversation_id,
         task.session.profile_name,
+        task.notify_on_done,
     )
-

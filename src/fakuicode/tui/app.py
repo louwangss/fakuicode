@@ -78,7 +78,16 @@ from fakuicode.skills.install import (
 from fakuicode.skills.install_broker import SkillInstallBroker
 from fakuicode.skills.trust import SkillTrustRepository
 import fakuicode.skills as skill_package
+import fakuicode.subagents as subagent_package
 from fakuicode.storage import ConversationRecord, ConversationStore
+from fakuicode.subagents import AgentCatalog, ChildRuntimeFactory, TaskManager
+from fakuicode.subagents.tools import (
+    AgentTool,
+    SendMessageTool,
+    TaskGetTool,
+    TaskListTool,
+    TaskStopTool,
+)
 from fakuicode.tools.policy import WorkspacePolicy
 from fakuicode.tools.base import ToolExecution
 from fakuicode.tools.registry import ToolRegistry
@@ -191,7 +200,12 @@ class FakuicodeApp(App[None]):
 
     TITLE = "Fakuicode"
     CSS_PATH = "fakuicode.tcss"
-    BINDINGS = [("escape", "cancel", "Cancel"), ("ctrl+c", "quit", "退出"), ("ctrl+q", "quit", "退出")]
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        ("ctrl+b", "background_subagent", "后台运行"),
+        ("ctrl+c", "quit", "退出"),
+        ("ctrl+q", "quit", "退出"),
+    ]
 
     def __init__(
         self,
@@ -215,8 +229,12 @@ class FakuicodeApp(App[None]):
         instruction_loader: InstructionSnapshotLoader | None = None,
         memory_service: MemoryService | None = None,
         skill_user_root: Path | None = None,
+        agent_user_root: Path | None = None,
         skill_trust_repository: SkillTrustRepository | None = None,
         skill_fetcher: SkillPackageFetcher | None = None,
+        enable_subagent_background: bool = True,
+        subagent_auto_background_seconds: float = 60.0,
+        subagent_max_concurrent: int = 2,
         clock_ns: Callable[[], int] = time_ns,
     ) -> None:
         super().__init__()
@@ -237,6 +255,7 @@ class FakuicodeApp(App[None]):
         self._instruction_loader = instruction_loader
         self.memory_service = memory_service
         self._skill_user_root = skill_user_root
+        self._agent_user_root = agent_user_root
         self._skill_trust_repository = skill_trust_repository
         self._skill_fetcher = skill_fetcher
         self._skill_trust_broker = SkillTrustBroker()
@@ -256,6 +275,18 @@ class FakuicodeApp(App[None]):
         self._mcp_trust_queue: list[McpServerConfig] = []
         self._mcp_trust_prompt: McpTrustPrompt | None = None
         self._approval_broker: ApprovalBroker | None = None
+        self._task_manager: TaskManager | None = None
+        self._agent_tool: AgentTool | None = None
+        self._enable_subagent_background = enable_subagent_background
+        self._subagent_auto_background_seconds = subagent_auto_background_seconds
+        self._subagent_max_concurrent = subagent_max_concurrent
+        builtin_agents = Path(subagent_package.__file__).parent / "builtin"
+        user_agents = agent_user_root or self.workspace / ".fakuicode" / "__user_agents_disabled__"
+        self._agent_catalog = AgentCatalog.load(
+            project_root=self.workspace / ".fakuicode" / "agents",
+            user_root=user_agents,
+            builtin_root=builtin_agents,
+        )
         self._active_permission_request_id: str | None = None
         self._inline_prompt: PermissionPrompt | PlanExecutionPrompt | None = None
         self.store = store
@@ -309,6 +340,51 @@ class FakuicodeApp(App[None]):
                 permission_manager=permissions,
                 hook_engine=self._hook_engine,
             )
+            task_manager = TaskManager(max_concurrent=self._subagent_max_concurrent)
+
+            def child_registry(child_permissions: PermissionManager) -> ToolRegistry:
+                child_hooks = HookEngine(
+                    self._hook_snapshot.rules,
+                    diagnostic_sink=self._record_hook_diagnostic,
+                    workspace=self.workspace,
+                )
+                return ToolRegistry(
+                    policy,
+                    permission_manager=child_permissions,
+                    hook_engine=child_hooks,
+                )
+
+            child_runtime = ChildRuntimeFactory(
+                store=self.store,
+                parent_conversation_id=self.conversation.id if self.conversation is not None else None,
+                workspace=self.workspace,
+                profiles=self.profiles,
+                active_profile_name=self.profile_name,
+                provider_factory=self._create_child_provider,
+                tool_registry_factory=child_registry,
+                parent_permissions=permissions,
+                approval_handler=broker,
+                project_instructions=self.instruction_snapshot.text,
+                parent_request_provider=lambda: getattr(
+                    getattr(getattr(self, "session", None), "runner", None),
+                    "last_successful_request",
+                    None,
+                ),
+            )
+            agent_tool = AgentTool(
+                self._agent_catalog,
+                child_runtime,
+                task_manager,
+                inline_timeout_seconds=self._subagent_auto_background_seconds,
+                background_enabled=self._enable_subagent_background,
+            )
+            registry.register_system(agent_tool)
+            registry.register_system(TaskListTool(task_manager))
+            registry.register_system(TaskGetTool(task_manager))
+            registry.register_system(TaskStopTool(task_manager))
+            registry.register_system(SendMessageTool(task_manager))
+            self._task_manager = task_manager
+            self._agent_tool = agent_tool
             for adapter in self._mcp_adapters:
                 registry.register(adapter)
             if not _provider_supports_skill_context(provider):
@@ -363,13 +439,9 @@ class FakuicodeApp(App[None]):
                 cancel_event=cancel,
             )
 
-            def child_registry() -> ToolRegistry:
-                child = ToolRegistry(
-                    policy,
-                    permission_manager=permissions,
-                    owns_permission_manager=False,
-                    hook_engine=self._hook_engine,
-                )
+            def skill_child_registry() -> ToolRegistry:
+                child_permissions = permissions.spawn_child(approval_handler=broker)
+                child = child_registry(child_permissions)
                 for adapter in self._mcp_adapters:
                     child.register(adapter)
                 return child
@@ -382,7 +454,7 @@ class FakuicodeApp(App[None]):
                 active_profile_name=self.profile_name,
                 parent_messages=lambda: manager.parent_messages,
                 provider_factory=self._provider_factory,
-                tool_registry_factory=child_registry,
+                tool_registry_factory=skill_child_registry,
                 custom_instructions=self.instruction_snapshot.text,
                 readonly_memory_snapshot=self._capture_readonly_memory_snapshot,
             ) if self.store is not None and self.conversation is not None else None
@@ -418,6 +490,13 @@ class FakuicodeApp(App[None]):
             conversation.mount(SystemNotice(f"Permission configuration warning: {warning}"))
         for diagnostic in self._hook_snapshot.diagnostics:
             conversation.mount(SystemNotice(f"Hook 配置警告：{diagnostic}"))
+        for diagnostic in self._agent_catalog.diagnostics:
+            name = f" ({diagnostic.name})" if diagnostic.name else ""
+            conversation.mount(
+                SystemNotice(
+                    f"SubAgent 定义警告{name}：{diagnostic.path.name}: {diagnostic.message}"
+                )
+            )
         self._mount_instruction_warning(conversation)
         self._mount_first_memory_notice(conversation)
         self._restore_visible_history(conversation)
@@ -608,6 +687,11 @@ class FakuicodeApp(App[None]):
                 )
             elif event.kind in {"context_diagnostic", "hook_diagnostic"}:
                 continue
+            elif event.kind == "agent_result":
+                metadata = event.metadata or {}
+                name = metadata.get("name") if isinstance(metadata.get("name"), str) else "unknown"
+                status = metadata.get("status") if isinstance(metadata.get("status"), str) else "unknown"
+                conversation.mount(SystemNotice(f"SubAgent {name} · {status}"))
             elif event.kind == "system":
                 metadata = event.metadata or {}
                 if metadata.get("context_boundary") == "clear" or not event.content:
@@ -619,6 +703,9 @@ class FakuicodeApp(App[None]):
 
     def on_unmount(self) -> None:
         self._is_closing = True
+        if self._task_manager is not None:
+            self._task_manager.close()
+            self._task_manager = None
         if isinstance(self.session, AgentSessionController):
             self.session.close()
         self._hook_engine.dispatch(
@@ -1531,6 +1618,10 @@ class FakuicodeApp(App[None]):
 
     def _close_agent_session(self) -> None:
         self._dismiss_inline_prompt()
+        if self._task_manager is not None:
+            self._task_manager.close()
+            self._task_manager = None
+        self._agent_tool = None
         current = getattr(self, "session", None)
         if isinstance(current, AgentSessionController):
             manager = getattr(current.runner.tools, "permission_manager", None)
@@ -1539,6 +1630,16 @@ class FakuicodeApp(App[None]):
             current.close()
         self._approval_broker = None
         self._active_permission_request_id = None
+
+    def _create_child_provider(self, config: ProviderConfig):
+        client = getattr(self._provider, "client", None)
+        try:
+            parameters = inspect.signature(self._provider_factory).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if client is not None and "client" in parameters:
+            return self._provider_factory(config, client=client)
+        return self._provider_factory(config)
 
     def _start_stream_turn(
         self,
@@ -1635,12 +1736,21 @@ class FakuicodeApp(App[None]):
             self._skill_install_cancel_event.set()
             self._set_status("正在取消 Skill 安装…")
             return
+        if self._agent_tool is not None and self._agent_tool.background_current():
+            self._notice("当前子 Agent 将继续在后台运行。")
+            self._set_status("子 Agent 已转入后台…")
+            return
         if (self._active_turn is None and not self._compact_active) or self._cancel_event is None:
             return
         self._cancel_event.set()
         if isinstance(self.session, AgentSessionController):
             self.session.cancel()
         self._set_status("Cancelling…")
+
+    def action_background_subagent(self) -> None:
+        tool = self._agent_tool
+        if tool is not None and tool.background_current():
+            self._notice("当前子 Agent 将继续在后台运行。")
 
     def _notify_stream_finished(self, error: str | None = None) -> None:
         if self._is_closing:
@@ -1662,6 +1772,7 @@ class FakuicodeApp(App[None]):
         self._show_next_skill_trust()
         self._show_memory_diagnostics()
         self._drain_permission_request()
+        self._drain_task_notifications()
         handled_events = False
         for _ in range(256):
             try:
@@ -1694,6 +1805,8 @@ class FakuicodeApp(App[None]):
         if request is None:
             return
         self._active_permission_request_id = request.request_id
+        if request.source and self._task_manager is not None:
+            self._task_manager.mark_waiting_approval(request.source, True)
         self._set_status(f"等待权限确认 · {request.tool_name}")
         self._show_inline_prompt(PermissionPrompt(request))
 
@@ -1705,14 +1818,37 @@ class FakuicodeApp(App[None]):
         self._dismiss_inline_prompt()
         self._active_permission_request_id = None
         broker = self._approval_broker
+        request_source = message.prompt.request.source
+        if request_source and self._task_manager is not None:
+            self._task_manager.mark_waiting_approval(request_source, False)
         if message.cancel_turn:
             # Cancel before unblocking the tool worker so it cannot start
             # another model round after receiving this denial.
-            self.action_cancel()
+            if request_source and self._task_manager is not None:
+                self._task_manager.stop_by_name(request_source)
+            else:
+                self.action_cancel()
         if broker is not None:
             broker.resolve(request_id, message.choice)
         if not message.cancel_turn:
             self._set_status("继续执行…")
+
+    def _drain_task_notifications(self) -> None:
+        manager = self._task_manager
+        if manager is None or not isinstance(self.session, AgentSessionController):
+            return
+        for task_id in manager.drain_notifications():
+            snapshot = manager.get(task_id)
+            if snapshot is None:
+                continue
+            self.session.enqueue_agent_result(
+                task_id=snapshot.id,
+                name=snapshot.name,
+                status=snapshot.status,
+                result=snapshot.result,
+                error=snapshot.error,
+            )
+            self._notice(f"SubAgent {snapshot.name} · {snapshot.status}")
 
     @on(PlanExecutionPrompt.Resolved)
     def _resolve_plan_execution(self, message: PlanExecutionPrompt.Resolved) -> None:

@@ -4,11 +4,14 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 from fakuicode.models import (
+    AgentMessage,
     AgentStreamEvent,
     ProfileSet,
     ProviderConfig,
     ToolCall,
+    ToolDefinition,
 )
+from fakuicode.providers.base import AgentRequest
 from fakuicode.permissions.config import PermissionConfigSnapshot
 from fakuicode.permissions.manager import PermissionManager
 from fakuicode.permissions.models import ApprovalChoice, PermissionMode
@@ -196,3 +199,95 @@ def test_runtime_rejects_unknown_profile_override(tmp_path: Path) -> None:
     with pytest.raises(ChildRuntimeError, match="Profile"):
         factory.create_defined(_definition(tmp_path), profile_override="missing")
 
+
+def test_fork_runtime_reuses_parent_prompt_and_message_prefix_but_removes_control_tools(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.subagents.runtime import ChildRuntimeFactory
+
+    providers: list[TextProvider] = []
+
+    def provider_factory(config: ProviderConfig) -> TextProvider:
+        provider = TextProvider(config)
+        providers.append(provider)
+        return provider
+
+    seed = AgentRequest(
+        (
+            AgentMessage("user", "parent question"),
+            AgentMessage("assistant", "parent answer"),
+        ),
+        (
+            ToolDefinition("read_file", "read", {"type": "object"}),
+            ToolDefinition("agent", "delegate", {"type": "object"}),
+            ToolDefinition("task_list", "tasks", {"type": "object"}),
+        ),
+        system_prompt="stable parent prompt",
+        system_supplement="dynamic parent supplement",
+        output_token_limit=777,
+    )
+    permissions = PermissionManager(
+        PermissionConfigSnapshot(),
+        DangerousCommandGuard(tmp_path),
+    )
+    store = ConversationStore(tmp_path / "fork.sqlite3")
+    parent = store.create_conversation("Main", tmp_path, "default")
+    factory = ChildRuntimeFactory(
+        store=store,
+        parent_conversation_id=parent.id,
+        workspace=tmp_path,
+        profiles=ProfileSet({"default": _config()}, "default"),
+        active_profile_name="default",
+        provider_factory=provider_factory,
+        tool_registry_factory=lambda child_permissions: ToolRegistry(
+            WorkspacePolicy(tmp_path),
+            permission_manager=child_permissions,
+        ),
+        parent_permissions=permissions,
+        parent_request_provider=lambda: seed,
+    )
+
+    child = factory.create_fork(name="fork-one")
+    outcome = child.run_to_completion("inspect another module")
+
+    assert outcome.status == "completed"
+    request = providers[0].requests[0]
+    assert request.system_prompt == seed.system_prompt
+    assert request.system_supplement == seed.system_supplement
+    assert request.output_token_limit == seed.output_token_limit
+    assert request.messages[: len(seed.messages)] == seed.messages
+    assert "inspect another module" in request.messages[-1].content
+    assert "不要启动其他子 Agent" in request.messages[-1].content
+    assert [tool.name for tool in request.tools] == ["read_file"]
+    assert child.role == "fork"
+    child_events = store.load_events(child.conversation_id)
+    assert any(event.kind == "user" for event in child_events)
+    assert all(event.content != "parent question" for event in child_events)
+
+
+def test_fork_runtime_requires_a_successful_parent_request(tmp_path: Path) -> None:
+    from fakuicode.subagents.runtime import ChildRuntimeFactory, ChildRuntimeError
+
+    permissions = PermissionManager(
+        PermissionConfigSnapshot(),
+        DangerousCommandGuard(tmp_path),
+    )
+    factory = ChildRuntimeFactory(
+        store=None,
+        parent_conversation_id=None,
+        workspace=tmp_path,
+        profiles=ProfileSet({"default": _config()}, "default"),
+        active_profile_name="default",
+        provider_factory=TextProvider,
+        tool_registry_factory=lambda child_permissions: ToolRegistry(
+            WorkspacePolicy(tmp_path),
+            permission_manager=child_permissions,
+        ),
+        parent_permissions=permissions,
+        parent_request_provider=lambda: None,
+    )
+
+    import pytest
+
+    with pytest.raises(ChildRuntimeError, match="成功请求"):
+        factory.create_fork()
