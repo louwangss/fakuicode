@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fakuicode"
+version = "0.1.0"
+description = "A streaming terminal chat assistant for Anthropic and OpenAI APIs"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27,<1",
+    "jsonschema>=4.20,<5",
+    "mcp>=1.27,<2",
+    "PyYAML>=6,<7",
+    "rich>=13,<15",
+    "textual>=8.2,<9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+fakuicode = "fakuicode.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"fakuicode.skills" = ["builtin/*/SKILL.md"]

@@ -1,0 +1,39 @@
+# 复制为 fakuicode.yaml 后，替换需要使用的 API Key。
+# fakuicode.yaml 已被 Git 忽略；不要提交真实密钥。
+#
+# 每个 profile 都会出现在应用的 /model 选择器中：profile 名用于区分配置，
+# model 是实际请求的模型名。base_url 只填 API 根地址，不要加 /chat/completions。
+# 当前程序使用 profiles 格式；暂不支持 providers + profiles 的嵌套分组格式。
+
+# 启动时使用的 profile 名；之后可在 TUI 输入 /model 切换。
+default_profile: glm-coding
+
+profiles:
+  # OpenAI 官方 API
+  openai-fast:
+    protocol: openai
+    model: gpt-5-mini
+    base_url: https://api.openai.com/v1
+    api_key: YOUR_OPENAI_API_KEY
+    context_window: 128000
+
+  # Anthropic 官方 API。thinking 仅适用于 anthropic，且不需要 budget_tokens。
+  claude-thinking:
+    protocol: anthropic
+    model: claude-sonnet-4-6
+    base_url: https://api.anthropic.com/v1
+    api_key: YOUR_ANTHROPIC_API_KEY
+    context_window: 200000
+    thinking:
+      enabled: true
+
+  # 智谱 GLM Coding Plan（OpenAI Chat Completions 兼容协议）。
+  # 若使用按量计费的通用 GLM API，请改为：
+  #   base_url: https://open.bigmodel.cn/api/paas/v4
+  # 并将 model 改成你的账户可用模型。
+  glm-coding:
+    protocol: openai
+    model: glm-4.7
+    base_url: https://open.bigmodel.cn/api/coding/paas/v4
+    api_key: YOUR_GLM_API_KEY
+    context_window: 128000

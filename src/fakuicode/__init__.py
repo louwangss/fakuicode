@@ -1,0 +1,1 @@
+"""Fakuicode terminal chat assistant."""

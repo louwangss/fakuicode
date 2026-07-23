@@ -1,0 +1,7 @@
+# 复制到项目的 .fakuicode/mcp.yaml 后生效。
+# 请先确认本机已安装 Node.js 与 npx。
+mcp_servers:
+  context7:
+    type: stdio
+    command: npx.cmd
+    args: ["-y", "@upstash/context7-mcp"]

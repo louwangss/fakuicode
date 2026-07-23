@@ -1,0 +1,1 @@
+"""Fakuicode test package."""

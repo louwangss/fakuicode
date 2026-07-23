@@ -1,0 +1,1 @@
+"""Textual interface for Fakuicode."""
