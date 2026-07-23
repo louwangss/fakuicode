@@ -133,14 +133,19 @@ class PermissionManager:
         *,
         approval_handler: ApprovalHandler | None = None,
         repository: PermissionConfigRepository | None = None,
+        session_rules: tuple[Rule, ...] = (),
+        request_source: str | None = None,
+        owns_approval_handler: bool = True,
     ) -> None:
         self._snapshot = snapshot
         self._guard = command_guard
         self._approval_handler = approval_handler or RejectingApprovalHandler()
         self._repository = repository
         self._mode = snapshot.mode
-        self._session_rules: list[Rule] = []
+        self._session_rules = list(session_rules)
         self._rejected_targets: set[tuple[str, str]] = set()
+        self._request_source = request_source
+        self._owns_approval_handler = owns_approval_handler
         self._lock = RLock()
 
     @property
@@ -167,6 +172,30 @@ class PermissionManager:
             if self._snapshot.locked:
                 raise ValueError("Permission configuration is locked in strict mode.")
             self._mode = PermissionMode(mode)
+
+    def spawn_child(
+        self,
+        *,
+        mode: PermissionMode | None = None,
+        approval_handler: ApprovalHandler | None = None,
+        request_source: str | None = None,
+    ) -> PermissionManager:
+        """Copy the parent's permission ledger without sharing mutable decisions."""
+
+        with self._lock:
+            requested = self._mode if mode is None else PermissionMode(mode)
+            effective_mode = _narrower_mode(self._mode, requested)
+            child = PermissionManager(
+                self._snapshot,
+                self._guard,
+                approval_handler=approval_handler,
+                repository=self._repository,
+                session_rules=tuple(self._session_rules),
+                request_source=request_source,
+                owns_approval_handler=False,
+            )
+            child._mode = effective_mode
+            return child
 
     def authorize(
         self,
@@ -196,6 +225,7 @@ class PermissionManager:
                 decision.reason,
                 exact_rule,
                 prepared.permission_scope,
+                self._request_source,
             )
 
         choice = self._approval_handler.request(request, cancel_event=cancel_event)
@@ -232,9 +262,10 @@ class PermissionManager:
             return self._snapshot
 
     def close(self) -> None:
-        closer = getattr(self._approval_handler, "close", None)
-        if callable(closer):
-            closer()
+        if self._owns_approval_handler:
+            closer = getattr(self._approval_handler, "close", None)
+            if callable(closer):
+                closer()
         with self._lock:
             self._session_rules.clear()
             self._rejected_targets.clear()
@@ -273,3 +304,12 @@ class PermissionManager:
             "The user permanently allowed this exact target.",
             "user_confirmation",
         )
+
+
+def _narrower_mode(parent: PermissionMode, requested: PermissionMode) -> PermissionMode:
+    rank = {
+        PermissionMode.STRICT: 0,
+        PermissionMode.DEFAULT: 1,
+        PermissionMode.TRUSTED: 2,
+    }
+    return parent if rank[parent] <= rank[requested] else requested
