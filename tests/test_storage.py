@@ -45,6 +45,28 @@ def test_store_migrates_existing_database_and_hides_skill_children(tmp_path: Pat
         store.get_conversation(child.id)
 
 
+def test_store_persists_agent_children_without_listing_them_as_main_sessions(tmp_path: Path) -> None:
+    from fakuicode.storage import ConversationStore
+
+    store = ConversationStore(tmp_path / "store.sqlite3")
+    parent = store.create_conversation("Main", tmp_path, "default")
+
+    child = store.create_conversation(
+        "Agent: explore",
+        tmp_path,
+        "default",
+        conversation_type="agent",
+        parent_conversation_id=parent.id,
+        agent_name="explore",
+    )
+
+    restored = store.get_conversation(child.id)
+    assert restored.conversation_type == "agent"
+    assert restored.parent_conversation_id == parent.id
+    assert restored.agent_name == "explore"
+    assert [item.id for item in store.list_conversations()] == [parent.id]
+
+
 def test_store_persists_skill_activation_events_after_current_clear_boundary(tmp_path: Path) -> None:
     from fakuicode.storage import ConversationStore
 

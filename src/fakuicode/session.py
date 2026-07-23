@@ -126,6 +126,7 @@ class AgentSessionController:
         skill_manager: object | None = None,
         readonly_memory_snapshot: object | None = None,
         retry_provider_errors: bool = True,
+        max_iterations: int = 30,
     ) -> None:
         self.store = store
         self.conversation_id = conversation_id
@@ -158,6 +159,7 @@ class AgentSessionController:
             custom_instructions=custom_instructions,
             skill_manager=skill_manager,
             retry_provider_errors=retry_provider_errors,
+            max_iterations=max_iterations,
         )
         if skill_manager is not None:
             try:

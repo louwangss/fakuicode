@@ -7,6 +7,12 @@ from fakuicode.subagents.models import (
     CatalogDiagnostic,
     PermissionBehavior,
 )
+from fakuicode.subagents.runtime import (
+    ChildAgentSession,
+    ChildRunResult,
+    ChildRuntimeError,
+    ChildRuntimeFactory,
+)
 
 __all__ = [
     "AgentCatalog",
@@ -14,5 +20,9 @@ __all__ = [
     "AgentSource",
     "CatalogDiagnostic",
     "CatalogLoadError",
+    "ChildAgentSession",
+    "ChildRunResult",
+    "ChildRuntimeError",
+    "ChildRuntimeFactory",
     "PermissionBehavior",
 ]

@@ -54,6 +54,7 @@ class ConversationRecord:
     parent_conversation_id: str | None = None
     skill_name: str | None = None
     status: str = "active"
+    agent_name: str | None = None
 
 
 def default_store_path(home: Path | None = None) -> Path:
@@ -84,14 +85,25 @@ class ConversationStore:
         conversation_type: str = "main",
         parent_conversation_id: str | None = None,
         skill_name: str | None = None,
+        agent_name: str | None = None,
         status: str = "active",
     ) -> ConversationRecord:
-        if conversation_type not in {"main", "skill"}:
+        if conversation_type not in {"main", "skill", "agent"}:
             raise ValueError("Invalid conversation type.")
-        if conversation_type == "skill" and (not parent_conversation_id or not skill_name):
+        if conversation_type == "skill" and (
+            not parent_conversation_id or not skill_name or agent_name is not None
+        ):
             raise ValueError("Skill conversations require a parent and Skill name.")
-        if conversation_type == "main" and (parent_conversation_id is not None or skill_name is not None):
-            raise ValueError("Main conversations cannot have Skill parent metadata.")
+        if conversation_type == "agent" and (
+            not parent_conversation_id or not agent_name or skill_name is not None
+        ):
+            raise ValueError("Agent conversations require a parent and Agent name.")
+        if conversation_type == "main" and (
+            parent_conversation_id is not None
+            or skill_name is not None
+            or agent_name is not None
+        ):
+            raise ValueError("Main conversations cannot have child metadata.")
         with self._lock, self._connection:
             now = self._next_conversation_timestamp()
             record = ConversationRecord(
@@ -105,19 +117,21 @@ class ConversationStore:
                 parent_conversation_id,
                 skill_name,
                 status,
+                agent_name,
             )
             self._connection.execute(
                 """
                 INSERT INTO conversations (
                     id, title, workspace, profile_name, created_at, updated_at,
-                    conversation_type, parent_conversation_id, skill_name, status
+                    conversation_type, parent_conversation_id, skill_name, status, agent_name
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.id, record.title, str(record.workspace), record.profile_name,
                     record.created_at, record.updated_at, record.conversation_type,
                     record.parent_conversation_id, record.skill_name, record.status,
+                    record.agent_name,
                 ),
             )
         return record
@@ -490,7 +504,8 @@ class ConversationStore:
                     conversation_type TEXT NOT NULL DEFAULT 'main',
                     parent_conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
                     skill_name TEXT,
-                    status TEXT NOT NULL DEFAULT 'active'
+                    status TEXT NOT NULL DEFAULT 'active',
+                    agent_name TEXT
                 )
                 """
             )
@@ -516,6 +531,7 @@ class ConversationStore:
                 "parent_conversation_id": "ALTER TABLE conversations ADD COLUMN parent_conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE",
                 "skill_name": "ALTER TABLE conversations ADD COLUMN skill_name TEXT",
                 "status": "ALTER TABLE conversations ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+                "agent_name": "ALTER TABLE conversations ADD COLUMN agent_name TEXT",
             }
             for name, statement in migrations.items():
                 if name not in columns:
@@ -541,6 +557,7 @@ def _record_from_row(row: sqlite3.Row) -> ConversationRecord:
         row["parent_conversation_id"],
         row["skill_name"],
         row["status"],
+        row["agent_name"],
     )
 
 
