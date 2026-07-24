@@ -83,6 +83,7 @@ class WorktreeLease:
     base_sha: str
     state_path: Path
     lease_token: str
+    mappings: tuple[PathMapping, ...] = ()
     _lock_handle: IO[bytes] | None = field(default=None, repr=False, compare=False)
 
 

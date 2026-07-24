@@ -33,6 +33,7 @@ class GitRunner:
     ) -> GitResult:
         environment = os.environ.copy()
         environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment["GIT_ASKPASS"] = ""
         try:
             completed = subprocess.run(
                 ["git", *args],

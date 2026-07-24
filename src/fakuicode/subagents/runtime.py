@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import inspect
 from pathlib import Path
 from threading import Event, Lock
 from typing import Literal
@@ -17,11 +18,25 @@ from fakuicode.permissions.manager import (
     RejectingApprovalHandler,
 )
 from fakuicode.permissions.models import PermissionMode
+from fakuicode.permissions.safety import DangerousCommandGuard
+from fakuicode.prompting import build_request_envelope
 from fakuicode.providers.base import AgentRequest
 from fakuicode.session import AgentSessionController
 from fakuicode.storage import ConversationStore
 from fakuicode.subagents.models import AgentDefinition, PermissionBehavior
 from fakuicode.tools.registry import ToolRegistry
+from fakuicode.worktrees.manager import (
+    WorktreeError,
+    WorktreeManager,
+    WorktreeUnavailableError,
+)
+from fakuicode.worktrees.models import (
+    ChildExecutionContext,
+    PathMapping,
+    WorktreeIdentity,
+    WorktreeLease,
+    WorktreeReleaseReport,
+)
 
 
 ChildRunStatus = Literal["completed", "failed", "cancelled"]
@@ -140,6 +155,8 @@ class ChildAgentSession:
         registry: ToolRegistry,
         store: ConversationStore | None,
         task_prefix: str = "",
+        execution_context: ChildExecutionContext | None = None,
+        worktree_manager: WorktreeManager | None = None,
     ) -> None:
         self.id = session_id
         self.name = name
@@ -150,6 +167,9 @@ class ChildAgentSession:
         self.registry = registry
         self.store = store
         self.task_prefix = task_prefix.strip()
+        self.execution_context = execution_context
+        self.worktree_manager = worktree_manager
+        self.release_report: WorktreeReleaseReport | None = None
         self._run_lock = Lock()
         self._cancel_event: Event | None = None
         self._closed = False
@@ -168,6 +188,7 @@ class ChildAgentSession:
             raise ChildRuntimeError("子 Agent 已有任务正在运行")
         cancel_event = Event()
         self._cancel_event = cancel_event
+        self.touch()
         try:
             task_text = task.strip()
             if self.task_prefix:
@@ -181,6 +202,7 @@ class ChildAgentSession:
         except Exception:
             return ChildRunResult("", "failed", "子 Agent 运行时发生内部错误")
         finally:
+            self.touch()
             self._cancel_event = None
             self._run_lock.release()
 
@@ -190,14 +212,47 @@ class ChildAgentSession:
             active.set()
         self.controller.cancel()
 
+    def touch(self) -> None:
+        if self.execution_context is not None and self.worktree_manager is not None:
+            self.worktree_manager.touch(self.execution_context.lease)
+
     def close(self, *, status: str = "completed") -> None:
         if self._closed:
             return
         self._closed = True
         self.cancel()
-        self.controller.close()
-        if self.store is not None:
-            self.store.update_conversation_status(self.conversation_id, status)
+        try:
+            self.controller.close()
+            if self.store is not None:
+                self.store.update_conversation_status(self.conversation_id, status)
+        finally:
+            if self.execution_context is not None and self.worktree_manager is not None:
+                try:
+                    self.release_report = self.worktree_manager.release(
+                        self.execution_context.lease
+                    )
+                except WorktreeError:
+                    self.release_report = WorktreeReleaseReport(
+                        "unavailable",
+                        False,
+                        self.execution_context.branch,
+                        self.execution_context.execution_workspace,
+                        "Worktree 关闭审计失败。",
+                    )
+
+    @property
+    def execution(self) -> dict[str, object]:
+        context = self.execution_context
+        if context is None:
+            return {"isolation": "shared"}
+        status = self.release_report.status if self.release_report is not None else "active"
+        return {
+            "isolation": "worktree",
+            "branch": context.branch,
+            "workspace": str(context.execution_workspace),
+            "base_sha": context.base_sha,
+            "status": status,
+        }
 
 
 class ChildRuntimeFactory:
@@ -210,11 +265,14 @@ class ChildRuntimeFactory:
         profiles: ProfileSet,
         active_profile_name: str,
         provider_factory: Callable[[ProviderConfig], object],
-        tool_registry_factory: Callable[[PermissionManager], ToolRegistry],
+        tool_registry_factory: Callable[..., ToolRegistry],
         parent_permissions: PermissionManager,
         approval_handler: ApprovalHandler | None = None,
         project_instructions: str = "",
         parent_request_provider: Callable[[], AgentRequest | None] | None = None,
+        worktree_manager: WorktreeManager | None = None,
+        project_instruction_provider: Callable[[Path], str] | None = None,
+        memory_service: object | None = None,
     ) -> None:
         self.store = store
         self.parent_conversation_id = parent_conversation_id
@@ -227,6 +285,9 @@ class ChildRuntimeFactory:
         self.approval_handler = approval_handler
         self.project_instructions = project_instructions.strip()
         self.parent_request_provider = parent_request_provider
+        self.worktree_manager = worktree_manager
+        self.project_instruction_provider = project_instruction_provider
+        self.memory_service = memory_service
 
     def create_defined(
         self,
@@ -234,6 +295,7 @@ class ChildRuntimeFactory:
         *,
         profile_override: str | None = None,
         name: str | None = None,
+        isolation: str | None = None,
     ) -> ChildAgentSession:
         instance_name = name or f"{definition.name}-{str(uuid4())[:8]}"
         profile_name = profile_override or definition.profile
@@ -243,72 +305,95 @@ class ChildRuntimeFactory:
             config = self.profiles.get(profile_name)
         except KeyError as error:
             raise ChildRuntimeError(f"Profile '{profile_name}' 不存在") from error
-        permissions = self.parent_permissions.spawn_child(
-            mode=_requested_mode(definition.permission_mode),
-            approval_handler=(
-                RejectingApprovalHandler()
-                if definition.permission_mode is PermissionBehavior.DONT_ASK
-                else self.approval_handler
-            ),
-            request_source=instance_name,
+        effective_isolation = (
+            "worktree"
+            if isolation == "worktree" or definition.isolation == "worktree"
+            else None
         )
-        registry = self.tool_registry_factory(permissions)
-        allowed = _allowed_tools(registry, definition)
-        registry.set_visible_tools(allowed)
+        session_uuid = uuid4()
+        lease = self._create_worktree(
+            WorktreeIdentity.for_role(session_uuid, definition.name),
+            effective_isolation,
+        )
         conversation_id = str(uuid4())
-        if self.store is not None:
-            if self.parent_conversation_id is None:
-                registry.close()
-                raise ChildRuntimeError("持久化子 Agent 缺少父会话")
-            child = self.store.create_conversation(
-                f"Agent: {instance_name}",
-                self.workspace,
-                profile_name,
-                conversation_type="agent",
-                parent_conversation_id=self.parent_conversation_id,
-                agent_name=definition.name,
-            )
-            conversation_id = child.id
-            self.store.append_event(
-                child.id,
-                "system",
-                "",
-                metadata={
-                    "agent_run": definition.name,
-                    "parent_conversation_id": self.parent_conversation_id,
-                    "profile": profile_name,
-                    "source": definition.source.value,
-                    "status": "active",
-                },
-            )
-        instructions = "\n\n".join(
-            part
-            for part in (
-                self.project_instructions,
-                _CHILD_CONTRACT,
-                f"## 角色：{definition.name}\n\n{definition.prompt}",
-            )
-            if part
-        )
+        conversation_created = False
         try:
+            if self.store is not None:
+                if self.parent_conversation_id is None:
+                    raise ChildRuntimeError("持久化子 Agent 缺少父会话")
+                child = self.store.create_conversation(
+                    f"Agent: {instance_name}",
+                    self.workspace,
+                    profile_name,
+                    conversation_type="agent",
+                    parent_conversation_id=self.parent_conversation_id,
+                    agent_name=definition.name,
+                )
+                conversation_id = child.id
+                conversation_created = True
+            context = self._execution_context(lease, conversation_id)
+            execution_workspace = (
+                context.execution_workspace if context is not None else self.workspace
+            )
+            permissions = self.parent_permissions.spawn_child(
+                mode=_requested_mode(definition.permission_mode),
+                approval_handler=(
+                    RejectingApprovalHandler()
+                    if definition.permission_mode is PermissionBehavior.DONT_ASK
+                    else self.approval_handler
+                ),
+                request_source=instance_name,
+                command_guard=DangerousCommandGuard(execution_workspace),
+            )
+            registry = self._create_registry(permissions, context)
+            allowed = _allowed_tools(registry, definition)
+            registry.set_visible_tools(allowed)
+            project_instructions = self._instructions_for(execution_workspace)
+            instructions = "\n\n".join(
+                part
+                for part in (
+                    project_instructions,
+                    _CHILD_CONTRACT,
+                    _worktree_notice(context),
+                    f"## 角色：{definition.name}\n\n{definition.prompt}",
+                )
+                if part
+            )
+            if self.store is not None:
+                self.store.append_event(
+                    conversation_id,
+                    "system",
+                    "",
+                    metadata={
+                        "agent_run": definition.name,
+                        "parent_conversation_id": self.parent_conversation_id,
+                        "profile": profile_name,
+                        "source": definition.source.value,
+                        "status": "active",
+                        "execution": _execution_metadata(context),
+                    },
+                )
             controller = AgentSessionController(
                 self.provider_factory(config),
                 registry,
                 store=self.store,
                 conversation_id=conversation_id if self.store is not None else None,
                 custom_instructions=instructions,
+                memory_service=self.memory_service,
                 retry_provider_errors=False,
                 max_iterations=definition.max_turns or MAX_ITERATIONS,
             )
         except Exception:
-            registry.close()
-            if self.store is not None:
+            if "registry" in locals():
+                registry.close()
+            if self.store is not None and conversation_created:
                 self.store.update_conversation_status(conversation_id, "error")
+            self._release_failed_lease(lease)
             raise
         if definition.permission_mode is PermissionBehavior.PLAN:
             controller.mode = "plan"
         return ChildAgentSession(
-            session_id=str(uuid4()),
+            session_id=str(session_uuid),
             name=instance_name,
             role=definition.name,
             profile_name=profile_name,
@@ -316,9 +401,16 @@ class ChildRuntimeFactory:
             controller=controller,
             registry=registry,
             store=self.store,
+            execution_context=context,
+            worktree_manager=self.worktree_manager,
         )
 
-    def create_fork(self, *, name: str | None = None) -> ChildAgentSession:
+    def create_fork(
+        self,
+        *,
+        name: str | None = None,
+        isolation: str | None = None,
+    ) -> ChildAgentSession:
         if self.parent_request_provider is None:
             raise ChildRuntimeError("Fork 缺少父 Agent 请求快照提供器")
         seed = self.parent_request_provider()
@@ -330,51 +422,76 @@ class ChildRuntimeFactory:
         except KeyError as error:
             raise ChildRuntimeError(f"Profile '{profile_name}' 不存在") from error
         instance_name = name or f"fork-{str(uuid4())[:8]}"
-        permissions = self.parent_permissions.spawn_child(
-            approval_handler=self.approval_handler,
-            request_source=instance_name,
-        )
-        registry = self.tool_registry_factory(permissions)
-        seed_names = {definition.name for definition in seed.tools}
-        allowed = (
-            set(registry.all_names())
-            & seed_names
-            - _FORK_DISALLOWED_TOOLS
-        )
-        registry.set_visible_tools(allowed)
-        fork_template = AgentRequest(
-            seed.messages,
-            tuple(registry.definitions()),
-            seed.system_prompt,
-            seed.system_supplement,
-            output_token_limit=seed.output_token_limit,
+        session_uuid = uuid4()
+        lease = self._create_worktree(
+            WorktreeIdentity.for_fork(session_uuid),
+            "worktree" if isolation == "worktree" else None,
         )
         conversation_id = str(uuid4())
-        if self.store is not None:
-            if self.parent_conversation_id is None:
-                registry.close()
-                raise ChildRuntimeError("持久化 Fork 缺少父会话")
-            child = self.store.create_conversation(
-                f"Fork: {instance_name}",
-                self.workspace,
-                profile_name,
-                conversation_type="agent",
-                parent_conversation_id=self.parent_conversation_id,
-                agent_name="fork",
-            )
-            conversation_id = child.id
-            self.store.append_event(
-                child.id,
-                "system",
-                "",
-                metadata={
-                    "agent_run": "fork",
-                    "parent_conversation_id": self.parent_conversation_id,
-                    "profile": profile_name,
-                    "status": "active",
-                },
-            )
+        conversation_created = False
         try:
+            if self.store is not None:
+                if self.parent_conversation_id is None:
+                    raise ChildRuntimeError("持久化 Fork 缺少父会话")
+                child = self.store.create_conversation(
+                    f"Fork: {instance_name}",
+                    self.workspace,
+                    profile_name,
+                    conversation_type="agent",
+                    parent_conversation_id=self.parent_conversation_id,
+                    agent_name="fork",
+                )
+                conversation_id = child.id
+                conversation_created = True
+            context = self._execution_context(lease, conversation_id)
+            execution_workspace = (
+                context.execution_workspace if context is not None else self.workspace
+            )
+            permissions = self.parent_permissions.spawn_child(
+                approval_handler=self.approval_handler,
+                request_source=instance_name,
+                command_guard=DangerousCommandGuard(execution_workspace),
+            )
+            registry = self._create_registry(permissions, context)
+            seed_names = {definition.name for definition in seed.tools}
+            allowed = set(registry.all_names()) & seed_names - _FORK_DISALLOWED_TOOLS
+            registry.set_visible_tools(allowed)
+            supplement = seed.system_supplement
+            if context is not None:
+                envelope = build_request_envelope(
+                    workspace=execution_workspace,
+                    model=config.model,
+                    custom_instructions="\n\n".join(
+                        part
+                        for part in (
+                            self._instructions_for(execution_workspace),
+                            _CHILD_CONTRACT,
+                            _worktree_notice(context),
+                        )
+                        if part
+                    ),
+                )
+                supplement = envelope.supplement
+            fork_template = AgentRequest(
+                seed.messages,
+                tuple(registry.definitions()),
+                seed.system_prompt,
+                supplement,
+                output_token_limit=seed.output_token_limit,
+            )
+            if self.store is not None:
+                self.store.append_event(
+                    conversation_id,
+                    "system",
+                    "",
+                    metadata={
+                        "agent_run": "fork",
+                        "parent_conversation_id": self.parent_conversation_id,
+                        "profile": profile_name,
+                        "status": "active",
+                        "execution": _execution_metadata(context),
+                    },
+                )
             controller = AgentSessionController(
                 self.provider_factory(config),
                 registry,
@@ -383,15 +500,18 @@ class ChildRuntimeFactory:
                 retry_provider_errors=False,
                 request_template=fork_template,
                 preserve_request_history=True,
+                memory_service=self.memory_service,
             )
             controller.history = list(seed.messages)
         except Exception:
-            registry.close()
-            if self.store is not None:
+            if "registry" in locals():
+                registry.close()
+            if self.store is not None and conversation_created:
                 self.store.update_conversation_status(conversation_id, "error")
+            self._release_failed_lease(lease)
             raise
         return ChildAgentSession(
-            session_id=str(uuid4()),
+            session_id=str(session_uuid),
             name=instance_name,
             role="fork",
             profile_name=profile_name,
@@ -400,7 +520,77 @@ class ChildRuntimeFactory:
             registry=registry,
             store=self.store,
             task_prefix=_FORK_BOILERPLATE,
+            execution_context=context,
+            worktree_manager=self.worktree_manager,
         )
+
+    def _create_worktree(
+        self,
+        identity: WorktreeIdentity,
+        isolation: str | None,
+    ) -> WorktreeLease | None:
+        if isolation is None:
+            return None
+        if isolation != "worktree":
+            raise ChildRuntimeError("未知的子 Agent 隔离模式")
+        if self.worktree_manager is None:
+            raise WorktreeUnavailableError("当前仓库无法启用 Worktree 隔离")
+        return self.worktree_manager.create(identity)
+
+    def _execution_context(
+        self,
+        lease: WorktreeLease | None,
+        conversation_id: str,
+    ) -> ChildExecutionContext | None:
+        if lease is None:
+            return None
+        mappings = tuple(
+            mapping
+            for mapping in lease.mappings
+            if _path_within(mapping.alias, lease.execution_workspace)
+        )
+        artifact_relative = (
+            Path(".fakuicode") / "context-artifacts" / conversation_id
+        )
+        artifact_mapping = PathMapping(
+            lease.execution_workspace / artifact_relative,
+            self.workspace / artifact_relative,
+            "read_only",
+        )
+        return ChildExecutionContext(
+            project_workspace=self.workspace,
+            repo_root=lease.repo_root,
+            worktree_root=lease.worktree_root,
+            execution_workspace=lease.execution_workspace,
+            branch=lease.branch,
+            base_sha=lease.base_sha,
+            mappings=(*mappings, artifact_mapping),
+            lease=lease,
+        )
+
+    def _create_registry(
+        self,
+        permissions: PermissionManager,
+        context: ChildExecutionContext | None,
+    ) -> ToolRegistry:
+        try:
+            inspect.signature(self.tool_registry_factory).bind(permissions, context)
+        except (TypeError, ValueError):
+            return self.tool_registry_factory(permissions)
+        return self.tool_registry_factory(permissions, context)
+
+    def _instructions_for(self, workspace: Path) -> str:
+        if workspace == self.workspace or self.project_instruction_provider is None:
+            return self.project_instructions
+        return self.project_instruction_provider(workspace).strip()
+
+    def _release_failed_lease(self, lease: WorktreeLease | None) -> None:
+        if lease is None or self.worktree_manager is None:
+            return
+        try:
+            self.worktree_manager.release(lease)
+        except WorktreeError:
+            pass
 
 
 def _requested_mode(behavior: PermissionBehavior) -> PermissionMode | None:
@@ -428,3 +618,39 @@ def _allowed_tools(registry: ToolRegistry, definition: AgentDefinition) -> set[s
         registry.close()
         raise ChildRuntimeError("Agent 过滤后没有可用工具")
     return allowed
+
+
+def _worktree_notice(context: ChildExecutionContext | None) -> str:
+    if context is None:
+        return ""
+    return (
+        "## Worktree 隔离\n\n"
+        "你当前在独立的 Git Worktree 中工作，与父 Agent 的文件修改相互隔离。\n"
+        f"- 父工作目录：{context.project_workspace}\n"
+        f"- 当前工作目录：{context.execution_workspace}\n"
+        "- 父对话中的绝对路径只代表历史位置；需要将父目录前缀转换为当前目录后再操作。\n"
+        "- 修改已有文件前，必须在当前 Worktree 中重新读取，不能依赖父目录中的旧内容。\n"
+        "- Worktree 只隔离正常文件工具和工作目录，不是针对任意 Shell 命令的系统沙箱。"
+    )
+
+
+def _execution_metadata(
+    context: ChildExecutionContext | None,
+) -> dict[str, object]:
+    if context is None:
+        return {"isolation": "shared"}
+    return {
+        "isolation": "worktree",
+        "branch": context.branch,
+        "workspace": str(context.execution_workspace),
+        "base_sha": context.base_sha,
+        "status": "active",
+    }
+
+
+def _path_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False

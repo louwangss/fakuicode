@@ -28,6 +28,7 @@ _FIELDS = {
     "maxTurns",
     "permissionMode",
     "background",
+    "isolation",
 }
 
 
@@ -151,6 +152,9 @@ def _parse_definition(raw: str, *, source: AgentSource, path: Path) -> AgentDefi
     background = loaded.get("background", False)
     if not isinstance(background, bool):
         raise ValueError("background 必须是布尔值")
+    isolation = loaded.get("isolation")
+    if isolation not in {None, "worktree"}:
+        raise ValueError("isolation 只允许 worktree")
     return AgentDefinition(
         name=name,
         description=description,
@@ -163,6 +167,7 @@ def _parse_definition(raw: str, *, source: AgentSource, path: Path) -> AgentDefi
         max_turns=raw_turns,
         permission_mode=permission_mode,
         background=background,
+        isolation=isolation,
     )
 
 
@@ -207,4 +212,3 @@ def _optional_string_list(
         raise ValueError(f"{key} 必须是字符串数组")
     normalized = tuple(dict.fromkeys(item.strip() for item in value))
     return normalized
-

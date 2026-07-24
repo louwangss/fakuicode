@@ -130,7 +130,7 @@ class RunCommandTool:
                 lines.append(safe_entry.name)
         listing = "\n".join(lines)
         output = f"stdout:\n{listing}\nstderr:\n\nexit_code: 0"
-        return ToolExecution(True, output, f"listed {path.relative_to(self.policy.workspace).as_posix() or '.'}")
+        return ToolExecution(True, output, f"listed {self.policy.relative_target(path)}")
 
 
 CommandTools = RunCommandTool

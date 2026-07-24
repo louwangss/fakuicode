@@ -19,6 +19,7 @@ class FakeSession:
         self.prompts: list[str] = []
         self.cancelled = False
         self.closed = False
+        self.execution = {"isolation": "shared"}
 
     def run_to_completion(self, prompt: str, *, event_sink=None) -> ChildRunResult:
         del event_sink
@@ -153,6 +154,7 @@ def test_later_idle_session_replaces_the_same_name_for_followup() -> None:
     assert manager.wait(followup_id, timeout=1) is not None
     assert first.prompts == ["first"]
     assert replacement.prompts == ["second", "follow up"]
+    assert first.closed is True
     manager.close()
 
 

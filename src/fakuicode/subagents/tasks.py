@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from queue import Empty, SimpleQueue
 from threading import Condition, Event, RLock
 from time import monotonic, time_ns
-from typing import Literal, Protocol
+from typing import Literal, Mapping, Protocol
 from uuid import uuid4
 
 from fakuicode.models import TokenUsage
@@ -32,10 +32,13 @@ class ManagedChildSession(Protocol):
     role: str
     profile_name: str
     conversation_id: str
+    execution: Mapping[str, object]
 
     def run_to_completion(self, prompt: str, *, event_sink=None) -> ChildRunResult: ...
 
     def cancel(self) -> None: ...
+
+    def touch(self) -> None: ...
 
     def close(self, *, status: str = "completed") -> None: ...
 
@@ -62,6 +65,7 @@ class TaskSnapshot:
     conversation_id: str
     profile_name: str
     notify_on_done: bool
+    execution: Mapping[str, object]
 
 
 @dataclass
@@ -108,6 +112,7 @@ class TaskManager:
     ) -> str:
         if not prompt.strip() or not description.strip():
             raise TaskManagerError("任务 prompt 和 description 不能为空")
+        superseded: ManagedChildSession | None = None
         with self._changed:
             if self._closed:
                 raise TaskManagerError("后台任务管理器已经关闭")
@@ -119,6 +124,7 @@ class TaskManager:
                     for task in self._tasks.values()
                 ):
                     raise TaskManagerError(f"Agent 名称 '{session.name}' 已被占用")
+                superseded = self._sessions.pop(existing_session_id, None)
             if any(
                 task.session.id == session.id and task.status not in _TERMINAL
                 for task in self._tasks.values()
@@ -139,20 +145,28 @@ class TaskManager:
             self._tasks[task_id] = task
             self._executor.submit(self._run, task_id)
             self._changed.notify_all()
-            return task_id
+        if superseded is not None:
+            try:
+                superseded.close(status="completed")
+            except Exception:
+                pass
+        return task_id
 
     def send_message(self, name: str, message: str) -> str:
         with self._lock:
             session_id = self._names.get(name)
             session = self._sessions.get(session_id) if session_id is not None else None
-        if session is None:
-            raise TaskManagerError(f"找不到仍存活的 Agent：{name}")
-        return self.launch(
-            session,
-            message,
-            f"续派给 {name}",
-            notify_on_done=True,
-        )
+            if session is None:
+                raise TaskManagerError(f"找不到仍存活的 Agent：{name}")
+            touch = getattr(session, "touch", None)
+            if callable(touch):
+                touch()
+            return self.launch(
+                session,
+                message,
+                f"续派给 {name}",
+                notify_on_done=True,
+            )
 
     def get(self, task_id: str) -> TaskSnapshot | None:
         with self._lock:
@@ -286,15 +300,18 @@ class TaskManager:
                 ),
                 "completed",
             )
-            session.close(
-                status=(
-                    "cancelled"
-                    if latest == "cancelled"
-                    else "error"
-                    if latest == "failed"
-                    else "completed"
+            try:
+                session.close(
+                    status=(
+                        "cancelled"
+                        if latest == "cancelled"
+                        else "error"
+                        if latest == "failed"
+                        else "completed"
+                    )
                 )
-            )
+            except Exception:
+                continue
 
     def _run(self, task_id: str) -> None:
         with self._changed:
@@ -350,4 +367,5 @@ def _snapshot(task: _TaskRun) -> TaskSnapshot:
         task.session.conversation_id,
         task.session.profile_name,
         task.notify_on_done,
+        dict(getattr(task.session, "execution", {"isolation": "shared"})),
     )

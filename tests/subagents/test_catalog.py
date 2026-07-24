@@ -46,6 +46,7 @@ profile: inherit
 maxTurns: 12
 permissionMode: dontAsk
 background: true
+isolation: worktree
 """,
     )
 
@@ -56,6 +57,7 @@ background: true
     assert definition.max_turns == 12
     assert definition.permission_mode is PermissionBehavior.DONT_ASK
     assert definition.background is True
+    assert definition.isolation == "worktree"
 
 
 def test_invalid_project_override_shadows_lower_priority_definition(tmp_path: Path) -> None:
@@ -83,6 +85,7 @@ def test_invalid_project_override_shadows_lower_priority_definition(tmp_path: Pa
         "name: valid\ndescription: x\nmaxTurns: 31",
         "name: valid\ndescription: x\nunknownField: true",
         "name: valid\ndescription: x\ntools: read_file",
+        "name: valid\ndescription: x\nisolation: container",
     ),
 )
 def test_invalid_user_definition_is_reported_and_skipped(tmp_path: Path, frontmatter: str) -> None:
@@ -101,4 +104,3 @@ def test_invalid_builtin_definition_fails_fast(tmp_path: Path) -> None:
 
     with pytest.raises(CatalogLoadError, match="broken.md"):
         AgentCatalog.load(builtin_root=builtin)
-
