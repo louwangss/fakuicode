@@ -84,6 +84,26 @@ Screen {
     border-left: solid #4b5563;
 }
 
+.subagent-result {
+    height: auto;
+    margin: 1 0 0 0;
+    padding: 0 1;
+    color: #d1d5db;
+    background: #111827;
+    border-left: solid #14b8a6;
+}
+
+.subagent-result-failed,
+.subagent-result-cancelled {
+    border-left: solid #f59e0b;
+}
+
+.subagent-result-body {
+    height: auto;
+    padding: 0 1 1 1;
+    color: #d1d5db;
+}
+
 .assistant-turn {
     height: auto;
     margin: 1 0;

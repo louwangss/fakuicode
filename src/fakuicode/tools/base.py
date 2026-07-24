@@ -11,6 +11,10 @@ from fakuicode.models import ToolDefinition
 from fakuicode.permissions.models import PermissionScope
 
 
+FINISH_AGENT_TURN = "finish_agent_turn"
+FINISH_AGENT_TURN_MESSAGE = "finish_agent_turn_message"
+
+
 @dataclass(frozen=True)
 class ToolExecution:
     """A bounded local outcome before it is linked to a provider call."""

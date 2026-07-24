@@ -499,7 +499,8 @@ class ContextBuilder:
         candidates = [
             event
             for event in events
-            if event.sequence > covered_through and event.kind in {"user", "assistant", "tool_call", "tool_result"}
+            if event.sequence > covered_through
+            and event.kind in {"user", "assistant", "tool_call", "tool_result", "agent_result"}
         ]
         groups = _event_groups(candidates)
         if _character_count(groups) <= self.max_characters:
@@ -532,6 +533,9 @@ def messages_from_events(events: list[TimelineEvent]) -> list[AgentMessage]:
 
     for event in events:
         if event.kind == "user":
+            flush_results()
+            messages.append(AgentMessage("user", event.content))
+        elif event.kind == "agent_result":
             flush_results()
             messages.append(AgentMessage("user", event.content))
         elif event.kind == "assistant":

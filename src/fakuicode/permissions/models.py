@@ -79,6 +79,7 @@ class PermissionRequest:
     reason: str
     exact_rule: str
     scope: PermissionScope = PermissionScope.TARGET
+    source: str | None = None
 
 
 @dataclass(frozen=True)

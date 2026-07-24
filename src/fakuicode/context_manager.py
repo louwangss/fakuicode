@@ -183,7 +183,7 @@ class ContextManager:
                     (
                         event
                         for event in events
-                        if event.kind in {"user", "assistant", "tool_call", "tool_result"}
+                        if event.kind in {"user", "assistant", "tool_call", "tool_result", "agent_result"}
                     ),
                     key=lambda event: event.sequence,
                 )
@@ -193,7 +193,7 @@ class ContextManager:
                 self.conversation_id,
                 after_sequence=boundary,
             )
-            if event.kind in {"user", "assistant", "tool_call", "tool_result"}
+            if event.kind in {"user", "assistant", "tool_call", "tool_result", "agent_result"}
         ]
 
     def prepare_light(self, request: AgentRequest) -> ContextPreparationResult:

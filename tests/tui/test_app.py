@@ -1437,7 +1437,17 @@ def test_app_cycles_read_only_activity_in_one_line_and_keeps_the_final_answer() 
                     )
                 else:
                     assert [definition.name for definition in tools] == [
-                        "read_file", "write_file", "edit_file", "run_command", "find_files", "search_code"
+                        "read_file",
+                        "write_file",
+                        "edit_file",
+                        "run_command",
+                        "find_files",
+                        "search_code",
+                        "agent",
+                        "task_list",
+                        "task_get",
+                        "task_stop",
+                        "send_message",
                     ]
                     yield AgentStreamEvent("text_delta", "README.md is available at the workspace root.")
                 yield AgentStreamEvent("completed")
@@ -2533,6 +2543,68 @@ def test_exit_shortcut_stops_the_tui_cleanly() -> None:
             await pilot.press("ctrl+q")
 
         assert app.is_running is False
+
+    asyncio.run(run())
+
+
+def test_background_completion_renders_task_id_and_plain_result_report(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        from fakuicode.subagents.runtime import ChildRunResult
+        from fakuicode.tui.app import FakuicodeApp
+        from fakuicode.tui.widgets import SubagentResultNotice
+
+        class CompletedSession:
+            id = "session-report"
+            name = "delivery-plan"
+            role = "plan"
+            profile_name = "default"
+            conversation_id = "conversation-report"
+
+            def run_to_completion(self, prompt: str, *, event_sink=None):
+                del prompt, event_sink
+                return ChildRunResult(
+                    "## 配送方案\n\n**不要解析为 Rich markup**",
+                    "completed",
+                    tool_count=2,
+                    last_activity="read_file",
+                )
+
+            def cancel(self) -> None:
+                pass
+
+            def close(self, *, status: str = "completed") -> None:
+                del status
+
+        app = FakuicodeApp(
+            make_config(),
+            provider=AgentTextProvider(),
+            workspace=tmp_path,
+        )
+        async with app.run_test() as pilot:
+            assert app._task_manager is not None
+            task_id = app._task_manager.launch(
+                CompletedSession(),
+                "plan delivery",
+                "delivery plan",
+                notify_on_done=True,
+            )
+            assert app._task_manager.wait(task_id, timeout=1) is not None
+
+            for _ in range(20):
+                await pilot.pause()
+                if len(app.query(SubagentResultNotice)):
+                    break
+
+            report = app.query_one(SubagentResultNotice)
+            assert report.task_id == task_id
+            assert report.agent_name == "delivery-plan"
+            assert report.task_status == "completed"
+            rendered = report.result_body.render().plain
+            assert "## 配送方案" in rendered
+            assert "**不要解析为 Rich markup**" in rendered
+            assert task_id in report.title
 
     asyncio.run(run())
 

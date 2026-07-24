@@ -111,6 +111,7 @@ def main(
         ),
         memory_service=memory_service,
         skill_user_root=memory_home / ".fakuicode" / "skills",
+        agent_user_root=memory_home / ".fakuicode" / "agents",
         skill_trust_repository=SkillTrustRepository(
             memory_home / ".fakuicode" / "skill-trust.yaml"
         ),

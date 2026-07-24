@@ -218,6 +218,79 @@ def test_locked_snapshot_cannot_switch_runtime_mode(tmp_path: Path) -> None:
     assert manager.mode is PermissionMode.STRICT
 
 
+def test_child_permission_state_copies_parent_rules_without_sharing_mutations(tmp_path: Path) -> None:
+    parent_handler = RecordingApprovalHandler(ApprovalChoice.SESSION)
+    parent = _manager(tmp_path, parent_handler)
+    assert parent.authorize(_prepared(target="src/parent.py")).kind is DecisionKind.ALLOW
+    child_handler = RecordingApprovalHandler(ApprovalChoice.SESSION)
+
+    child = parent.spawn_child(
+        approval_handler=child_handler,
+        request_source="reviewer",
+    )
+
+    inherited = child.authorize(_prepared(target="src/parent.py", call_id="child-1"))
+    added = child.authorize(_prepared(target="src/child.py", call_id="child-2"))
+    assert inherited.kind is DecisionKind.ALLOW
+    assert added.kind is DecisionKind.ALLOW
+    assert len(child_handler.requests) == 1
+    assert child_handler.requests[0].source == "reviewer"
+    assert len(child.session_rules) == 2
+    assert len(parent.session_rules) == 1
+
+
+def test_child_observes_parent_rules_approved_after_spawn(tmp_path: Path) -> None:
+    parent_handler = RecordingApprovalHandler(ApprovalChoice.SESSION)
+    parent = _manager(tmp_path, parent_handler)
+    child_handler = RecordingApprovalHandler(ApprovalChoice.DENY)
+    child = parent.spawn_child(approval_handler=child_handler)
+    prepared = _prepared(target="src/shared.py")
+
+    assert parent.authorize(prepared).kind is DecisionKind.ALLOW
+    inherited = child.authorize(
+        _prepared(target="src/shared.py", call_id="child-late-rule")
+    )
+
+    assert inherited.kind is DecisionKind.ALLOW
+    assert inherited.layer == "parent_ledger"
+    assert child_handler.requests == []
+    assert child.session_rules == ()
+
+
+def test_child_permission_mode_cannot_elevate_parent_mode(tmp_path: Path) -> None:
+    parent = _manager(
+        tmp_path,
+        snapshot=PermissionConfigSnapshot(mode=PermissionMode.STRICT),
+    )
+
+    child = parent.spawn_child(mode=PermissionMode.TRUSTED)
+    decision = child.authorize(_prepared())
+
+    assert child.mode is PermissionMode.STRICT
+    assert decision.kind is DecisionKind.DENY
+    assert decision.layer == "mode"
+
+
+def test_child_close_does_not_close_shared_approval_handler(tmp_path: Path) -> None:
+    class CloseTrackingHandler(RecordingApprovalHandler):
+        def __init__(self) -> None:
+            super().__init__(ApprovalChoice.DENY)
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    handler = CloseTrackingHandler()
+    parent = _manager(tmp_path, handler)
+    child = parent.spawn_child(approval_handler=handler)
+
+    child.close()
+
+    assert handler.closed is False
+    parent.close()
+    assert handler.closed is True
+
+
 def test_trust_change_does_not_hot_reload_other_permission_fields(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

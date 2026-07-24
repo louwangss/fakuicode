@@ -32,3 +32,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "fakuicode.skills" = ["builtin/*/SKILL.md"]
+"fakuicode.subagents" = ["builtin/*.md"]

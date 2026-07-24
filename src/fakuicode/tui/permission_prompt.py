@@ -53,7 +53,12 @@ class PermissionPrompt(Vertical):
         self.request = request
 
     def compose(self) -> ComposeResult:
-        yield Static(f"{self.request.tool_name} 需要权限", classes="inline-choice-title", markup=False)
+        source = f" · 来自 SubAgent {self.request.source}" if self.request.source else ""
+        yield Static(
+            f"{self.request.tool_name} 需要权限{source}",
+            classes="inline-choice-title",
+            markup=False,
+        )
         target = (
             "整个 MCP 工具（授权适用于所有参数值）"
             if self.request.scope is PermissionScope.TOOL

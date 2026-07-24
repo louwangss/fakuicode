@@ -139,6 +139,7 @@ class AgentRunner:
         custom_instructions: str = "",
         skill_manager: object | None = None,
         retry_provider_errors: bool = True,
+        request_template: AgentRequest | None = None,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations must be positive.")
@@ -149,9 +150,16 @@ class AgentRunner:
         self.custom_instructions = custom_instructions
         self.skill_manager = skill_manager
         self.retry_provider_errors = retry_provider_errors
+        self.request_template = request_template
         self._last_successful_request: AgentRequest | None = None
         candidate_hooks = getattr(tools, "hook_engine", None)
         self.hook_engine = candidate_hooks if isinstance(candidate_hooks, HookEngine) else None
+
+    @property
+    def last_successful_request(self) -> AgentRequest | None:
+        """Return the immutable request snapshot eligible for a child fork."""
+
+        return self._last_successful_request
 
     def run(
         self,
@@ -349,6 +357,22 @@ class AgentRunner:
 
             history.append(AgentMessage("user", tool_results=tuple(results)))
             had_tool_results = True
+            finish_turn = getattr(self.tools, "finish_turn_message", None)
+            finish_message = (
+                finish_turn(tuple(results))
+                if callable(finish_turn)
+                else None
+            )
+            if isinstance(finish_message, str) and finish_message.strip():
+                # Start a synthetic final response so session persistence does
+                # not duplicate the assistant preamble that carried tool calls.
+                yield AgentStreamEvent(
+                    "progress",
+                    progress=AgentProgress(round_number, "model"),
+                )
+                yield AgentStreamEvent("text_delta", finish_message.strip())
+                yield AgentStreamEvent("completed")
+                return
             if round_number == self.max_iterations:
                 yield AgentStreamEvent("error", f"Agent stopped after reaching the {self.max_iterations}-round safety limit.")
                 return
@@ -428,6 +452,13 @@ class AgentRunner:
         turn_context: AgentTurnContext,
         consume_hook_prompts: bool = True,
     ) -> AgentRequest:
+        if self.request_template is not None:
+            return replace(
+                self.request_template,
+                messages=history,
+                tools=tools,
+                cancel_event=cancel_event,
+            )
         memory_snapshot = turn_context.memory_snapshot
         automatic_memory_enabled = memory_snapshot is not None
         memory = memory_snapshot.rendered if memory_snapshot is not None else ""

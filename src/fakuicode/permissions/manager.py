@@ -133,14 +133,21 @@ class PermissionManager:
         *,
         approval_handler: ApprovalHandler | None = None,
         repository: PermissionConfigRepository | None = None,
+        session_rules: tuple[Rule, ...] = (),
+        request_source: str | None = None,
+        owns_approval_handler: bool = True,
+        parent_manager: PermissionManager | None = None,
     ) -> None:
         self._snapshot = snapshot
         self._guard = command_guard
         self._approval_handler = approval_handler or RejectingApprovalHandler()
         self._repository = repository
         self._mode = snapshot.mode
-        self._session_rules: list[Rule] = []
+        self._session_rules = list(session_rules)
         self._rejected_targets: set[tuple[str, str]] = set()
+        self._request_source = request_source
+        self._owns_approval_handler = owns_approval_handler
+        self._parent_manager = parent_manager
         self._lock = RLock()
 
     @property
@@ -168,6 +175,31 @@ class PermissionManager:
                 raise ValueError("Permission configuration is locked in strict mode.")
             self._mode = PermissionMode(mode)
 
+    def spawn_child(
+        self,
+        *,
+        mode: PermissionMode | None = None,
+        approval_handler: ApprovalHandler | None = None,
+        request_source: str | None = None,
+    ) -> PermissionManager:
+        """Copy the parent's permission ledger without sharing mutable decisions."""
+
+        with self._lock:
+            requested = self._mode if mode is None else PermissionMode(mode)
+            effective_mode = _narrower_mode(self._mode, requested)
+            child = PermissionManager(
+                self._snapshot,
+                self._guard,
+                approval_handler=approval_handler,
+                repository=self._repository,
+                session_rules=tuple(self._session_rules),
+                request_source=request_source,
+                owns_approval_handler=False,
+                parent_manager=self,
+            )
+            child._mode = effective_mode
+            return child
+
     def authorize(
         self,
         prepared: PreparedToolCall,
@@ -177,6 +209,11 @@ class PermissionManager:
     ) -> Decision:
         subject = PermissionSubject(prepared.name, prepared.target, prepared.read_only)
         key = (prepared.name, prepared.target)
+        parent = self._parent_manager
+        if parent is not None:
+            inherited = parent._explicit_ledger_decision(subject)
+            if inherited is not None:
+                return inherited
         with self._lock:
             decision = self._decide(subject, read_only_task=read_only_task)
             if decision.kind is not DecisionKind.ASK:
@@ -196,6 +233,7 @@ class PermissionManager:
                 decision.reason,
                 exact_rule,
                 prepared.permission_scope,
+                self._request_source,
             )
 
         choice = self._approval_handler.request(request, cancel_event=cancel_event)
@@ -232,9 +270,10 @@ class PermissionManager:
             return self._snapshot
 
     def close(self) -> None:
-        closer = getattr(self._approval_handler, "close", None)
-        if callable(closer):
-            closer()
+        if self._owns_approval_handler:
+            closer = getattr(self._approval_handler, "close", None)
+            if callable(closer):
+                closer()
         with self._lock:
             self._session_rules.clear()
             self._rejected_targets.clear()
@@ -246,6 +285,27 @@ class PermissionManager:
             mode=self._mode,
             read_only_task=read_only_task,
         )
+
+    def _explicit_ledger_decision(
+        self,
+        subject: PermissionSubject,
+    ) -> Decision | None:
+        """Expose current explicit parent rules without inheriting its mode fallback."""
+
+        with self._lock:
+            decision = PermissionEngine(self._snapshot, self._guard).decide(
+                subject,
+                session_rules=tuple(self._session_rules),
+                mode=PermissionMode.STRICT,
+            )
+        if decision.kind is DecisionKind.ALLOW and decision.rule is not None:
+            return Decision(
+                DecisionKind.ALLOW,
+                decision.reason,
+                "parent_ledger",
+                decision.rule,
+            )
+        return None
 
     def _add_session_rule(self, expression: str) -> None:
         rule = parse_rule(expression, RuleEffect.ALLOW, RuleSource.SESSION)
@@ -273,3 +333,12 @@ class PermissionManager:
             "The user permanently allowed this exact target.",
             "user_confirmation",
         )
+
+
+def _narrower_mode(parent: PermissionMode, requested: PermissionMode) -> PermissionMode:
+    rank = {
+        PermissionMode.STRICT: 0,
+        PermissionMode.DEFAULT: 1,
+        PermissionMode.TRUSTED: 2,
+    }
+    return parent if rank[parent] <= rank[requested] else requested

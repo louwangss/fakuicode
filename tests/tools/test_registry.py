@@ -123,3 +123,53 @@ def test_registry_classifies_read_only_tools_without_exposing_writes(tmp_path: P
     assert registry.is_known("not_a_tool") is False
     assert registry.is_read_only("read_file") is True
     assert registry.is_read_only("write_file") is False
+
+
+def test_registry_accepts_finish_turn_directive_only_from_system_tools(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.models import ToolCall, ToolDefinition
+    from fakuicode.tools.base import ToolExecution, ToolPreparation, freeze_arguments
+    from fakuicode.tools.policy import WorkspacePolicy
+    from fakuicode.tools.registry import ToolRegistry
+
+    class DeferredTool:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        @property
+        def definition(self) -> ToolDefinition:
+            return ToolDefinition(
+                self._name,
+                "deferred work",
+                {"type": "object", "properties": {}},
+            )
+
+        @property
+        def read_only(self) -> bool:
+            return True
+
+        def prepare(self, arguments):
+            return ToolPreparation(freeze_arguments(arguments), self._name)
+
+        def execute_prepared(self, arguments, *, cancel_event=None):
+            del arguments, cancel_event
+            return ToolExecution(
+                True,
+                "queued",
+                "queued",
+                metadata={
+                    "finish_agent_turn": True,
+                    "finish_agent_turn_message": "后台任务已启动。",
+                },
+            )
+
+    registry = ToolRegistry(WorkspacePolicy(tmp_path), tools=())
+    registry.register_system(DeferredTool("system_deferred"))
+    registry.register(DeferredTool("ordinary_deferred"))
+
+    system_result = registry.execute(ToolCall("call-system", "system_deferred", {}))
+    ordinary_result = registry.execute(ToolCall("call-ordinary", "ordinary_deferred", {}))
+
+    assert registry.finish_turn_message((system_result,)) == "后台任务已启动。"
+    assert registry.finish_turn_message((ordinary_result,)) is None
