@@ -181,6 +181,7 @@ class PermissionManager:
         mode: PermissionMode | None = None,
         approval_handler: ApprovalHandler | None = None,
         request_source: str | None = None,
+        command_guard: DangerousCommandGuard | None = None,
     ) -> PermissionManager:
         """Copy the parent's permission ledger without sharing mutable decisions."""
 
@@ -189,7 +190,7 @@ class PermissionManager:
             effective_mode = _narrower_mode(self._mode, requested)
             child = PermissionManager(
                 self._snapshot,
-                self._guard,
+                command_guard or self._guard,
                 approval_handler=approval_handler,
                 repository=self._repository,
                 session_rules=tuple(self._session_rules),

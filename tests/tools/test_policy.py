@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from fakuicode.worktrees.models import PathMapping
+
 
 def test_workspace_policy_allows_paths_inside_the_workspace(tmp_path: Path) -> None:
     from fakuicode.tools.policy import WorkspacePolicy
@@ -145,3 +147,72 @@ def test_nonexistent_target_resolves_its_nearest_existing_symlink_ancestor(tmp_p
         WorkspacePolicy(workspace).resolve_path("linked/new/deep/file.txt")
 
     assert not (outside / "new").exists()
+
+
+def test_workspace_policy_allows_only_declared_external_path_mappings(tmp_path: Path) -> None:
+    from fakuicode.errors import ToolPolicyError
+    from fakuicode.tools.policy import WorkspacePolicy
+
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    dependency = tmp_path / "shared-dependency"
+    dependency.mkdir()
+    (dependency / "package.txt").write_text("shared\n", encoding="utf-8")
+    policy = WorkspacePolicy(
+        workspace,
+        mappings=(
+            PathMapping(workspace / "node_modules", dependency, "read_write"),
+        ),
+    )
+
+    resolved = policy.resolve_path("node_modules/package.txt")
+
+    assert resolved == dependency / "package.txt"
+    assert policy.relative_target(resolved) == "node_modules/package.txt"
+    with pytest.raises(ToolPolicyError, match="workspace"):
+        policy.resolve_path(str(tmp_path / "other" / "file.txt"))
+
+
+def test_read_only_mapping_requires_the_context_artifact_read_capability(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.errors import ToolPolicyError
+    from fakuicode.tools.policy import WorkspacePolicy
+
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    artifacts = tmp_path / "project" / ".fakuicode" / "context-artifacts" / "conv-1"
+    artifacts.mkdir(parents=True)
+    result = artifacts / "result.txt"
+    result.write_text("complete\n", encoding="utf-8")
+    alias = workspace / ".fakuicode" / "context-artifacts" / "conv-1"
+    policy = WorkspacePolicy(
+        workspace,
+        mappings=(PathMapping(alias, artifacts, "read_only"),),
+    )
+
+    with pytest.raises(ToolPolicyError):
+        policy.resolve_path(".fakuicode/context-artifacts/conv-1/result.txt")
+
+    assert policy.resolve_path(
+        ".fakuicode/context-artifacts/conv-1/result.txt",
+        allow_context_artifact_read=True,
+    ) == result
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        ".fakuicode/worktrees/child/file.py",
+        ".fakuicode/worktree-state/session.json",
+    ),
+)
+def test_workspace_policy_hides_managed_worktree_roots(
+    target: str,
+    tmp_path: Path,
+) -> None:
+    from fakuicode.errors import ToolPolicyError
+    from fakuicode.tools.policy import WorkspacePolicy
+
+    with pytest.raises(ToolPolicyError, match="sensitive"):
+        WorkspacePolicy(tmp_path).resolve_path(target)

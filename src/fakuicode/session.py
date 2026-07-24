@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -476,6 +476,7 @@ class AgentSessionController:
         status: str,
         result: str,
         error: str | None,
+        execution: Mapping[str, object] | None = None,
     ) -> None:
         """Persist one background result and expose it as untrusted user-like data next turn."""
 
@@ -486,6 +487,7 @@ class AgentSessionController:
                 "status": status,
                 "result": result,
                 "error": error,
+                "execution": dict(execution or {"isolation": "shared"}),
             },
             ensure_ascii=False,
             separators=(",", ":"),

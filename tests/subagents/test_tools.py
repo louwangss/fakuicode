@@ -15,6 +15,7 @@ class ImmediateSession:
         self.role = "explore"
         self.profile_name = "default"
         self.conversation_id = f"conversation-{name}"
+        self.execution = {"isolation": "shared"}
 
     def run_to_completion(self, prompt: str, *, event_sink=None) -> ChildRunResult:
         del event_sink
@@ -31,13 +32,31 @@ class RuntimeFactory:
     def __init__(self) -> None:
         self.created = []
 
-    def create_defined(self, definition, *, profile_override=None, name=None):
-        self.created.append((definition.name, profile_override, name))
-        return ImmediateSession(name or definition.name)
+    def create_defined(self, definition, *, profile_override=None, name=None, isolation=None):
+        self.created.append((definition.name, profile_override, name, isolation))
+        session = ImmediateSession(name or definition.name)
+        if isolation == "worktree":
+            session.execution = {
+                "isolation": "worktree",
+                "branch": "worktree/role-explore/session",
+                "workspace": "C:/child",
+                "base_sha": "a" * 40,
+                "status": "active",
+            }
+        return session
 
-    def create_fork(self, *, name=None):
-        self.created.append(("fork", None, name))
-        return ImmediateSession(name or "fork")
+    def create_fork(self, *, name=None, isolation=None):
+        self.created.append(("fork", None, name, isolation))
+        session = ImmediateSession(name or "fork")
+        if isolation == "worktree":
+            session.execution = {
+                "isolation": "worktree",
+                "branch": "worktree/fork/session",
+                "workspace": "C:/child",
+                "base_sha": "a" * 40,
+                "status": "active",
+            }
+        return session
 
 
 class BlockingSession(ImmediateSession):
@@ -61,8 +80,8 @@ class BlockingRuntimeFactory(RuntimeFactory):
         super().__init__()
         self.session = BlockingSession("blocking")
 
-    def create_defined(self, definition, *, profile_override=None, name=None):
-        self.created.append((definition.name, profile_override, name))
+    def create_defined(self, definition, *, profile_override=None, name=None, isolation=None):
+        self.created.append((definition.name, profile_override, name, isolation))
         return self.session
 
 
@@ -106,7 +125,8 @@ def test_agent_tool_has_stable_schema_and_returns_inline_result(tmp_path: Path) 
         "subagent_type",
         "profile",
         "run_in_background",
-        "name",
+            "name",
+            "isolation",
     }
     assert payload == {
         "ok": True,
@@ -114,8 +134,9 @@ def test_agent_tool_has_stable_schema_and_returns_inline_result(tmp_path: Path) 
         "status": "completed",
         "task_id": payload["task_id"],
         "result": "answer:inspect",
+        "execution": {"isolation": "shared"},
     }
-    assert runtime.created == [("explore", "cheap", "research")]
+    assert runtime.created == [("explore", "cheap", "research", None)]
     manager.close()
 
 
@@ -229,8 +250,51 @@ def test_agent_tool_fork_is_always_background_and_rejects_profile_override(
     payload = json.loads(launched.output)
     assert payload["mode"] == "background"
     assert payload["status"] == "async_launched"
-    assert runtime.created == [("fork", None, "fork-one")]
+    assert runtime.created == [("fork", None, "fork-one", None)]
     assert manager.wait(payload["task_id"], timeout=1) is not None
+    manager.close()
+
+
+def test_agent_tool_can_strengthen_a_defined_or_fork_session_to_worktree(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.subagents.tasks import TaskManager
+    from fakuicode.subagents.tools import AgentTool
+
+    manager = TaskManager(max_concurrent=1)
+    runtime = RuntimeFactory()
+    tool = AgentTool(_catalog(tmp_path), runtime, manager, inline_timeout_seconds=1)
+
+    defined = tool.execute(
+        {
+            "prompt": "inspect",
+            "description": "isolated role",
+            "subagent_type": "explore",
+            "isolation": "worktree",
+        }
+    )
+    defined_payload = json.loads(defined.output)
+    fork = tool.execute(
+        {
+            "prompt": "inspect",
+            "description": "isolated fork",
+            "isolation": "worktree",
+        }
+    )
+    fork_payload = json.loads(fork.output)
+
+    assert defined_payload["execution"] == {
+        "isolation": "worktree",
+        "branch": "worktree/role-explore/session",
+    }
+    assert fork_payload["execution"] == {
+        "isolation": "worktree",
+        "branch": "worktree/fork/session",
+    }
+    assert runtime.created == [
+        ("explore", None, None, "worktree"),
+        ("fork", None, None, "worktree"),
+    ]
     manager.close()
 
 

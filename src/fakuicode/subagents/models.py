@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Literal
 
 
 class AgentSource(str, Enum):
@@ -36,6 +37,7 @@ class AgentDefinition:
     max_turns: int | None = None
     permission_mode: PermissionBehavior = PermissionBehavior.INHERIT
     background: bool = False
+    isolation: Literal["worktree"] | None = None
 
 
 @dataclass(frozen=True)
@@ -44,4 +46,3 @@ class CatalogDiagnostic:
     path: Path
     message: str
     name: str | None = None
-

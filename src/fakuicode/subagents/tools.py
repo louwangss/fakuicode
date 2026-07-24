@@ -21,6 +21,7 @@ from fakuicode.tools.base import (
     ToolPreparation,
     freeze_arguments,
 )
+from fakuicode.worktrees.manager import WorktreeError
 
 
 _INSTANCE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -31,6 +32,7 @@ _AGENT_FIELDS = {
     "profile",
     "run_in_background",
     "name",
+    "isolation",
 }
 
 
@@ -70,6 +72,11 @@ class AgentTool:
                     "profile": {"type": "string", "description": "Profile 覆盖或 inherit"},
                     "run_in_background": {"type": "boolean", "description": "是否立即进入后台"},
                     "name": {"type": "string", "description": "本次子 Agent 的唯一可读名称"},
+                    "isolation": {
+                        "type": "string",
+                        "enum": ["worktree"],
+                        "description": "可选；要求子 Agent 在独立 Git Worktree 中运行",
+                    },
                 },
                 "required": ["prompt", "description"],
                 "additionalProperties": False,
@@ -95,6 +102,11 @@ class AgentTool:
                     raise ToolExecutionError(f"{key} 必须是字符串")
                 if value.strip():
                     normalized[key] = value.strip()
+        isolation = arguments.get("isolation")
+        if isolation is not None:
+            if isolation != "worktree":
+                raise ToolExecutionError("isolation 只允许 worktree")
+            normalized["isolation"] = isolation
         background = arguments.get("run_in_background", False)
         if not isinstance(background, bool):
             raise ToolExecutionError("run_in_background 必须是布尔值")
@@ -128,6 +140,7 @@ class AgentTool:
         if is_fork and arguments.get("profile") not in {None, "inherit"}:
             return _error("fork_profile_override", "Fork 必须继承父 Agent 的 Profile")
         definition = None
+        session = None
         if not is_fork:
             try:
                 definition = self.catalog.resolve(role)
@@ -139,6 +152,11 @@ class AgentTool:
             if is_fork:
                 session = self.runtime_factory.create_fork(
                     name=str(arguments["name"]) if "name" in arguments else None,
+                    isolation=(
+                        str(arguments["isolation"])
+                        if arguments.get("isolation") == "worktree"
+                        else None
+                    ),
                 )
             else:
                 assert definition is not None
@@ -150,6 +168,12 @@ class AgentTool:
                         else None
                     ),
                     name=str(arguments["name"]) if "name" in arguments else None,
+                    isolation=(
+                        "worktree"
+                        if arguments.get("isolation") == "worktree"
+                        or definition.isolation == "worktree"
+                        else None
+                    ),
                 )
             requested_background = is_fork or bool(arguments.get("run_in_background")) or (
                 definition.background if definition is not None else False
@@ -161,8 +185,22 @@ class AgentTool:
                 str(arguments["description"]),
                 notify_on_done=background,
             )
+        except WorktreeError as error:
+            return _error(
+                error.code,
+                {
+                    "worktree_unavailable": "当前仓库无法启用 Worktree 隔离。",
+                    "worktree_recovery_conflict": "已有 Worktree 无法通过安全恢复校验。",
+                }.get(error.code, "Worktree 隔离初始化失败。"),
+            )
         except (ChildRuntimeError, TaskManagerError) as error:
+            if session is not None:
+                try:
+                    session.close(status="error")
+                except Exception:
+                    pass
             return _error("launch_failed", str(error))
+        execution = _compact_execution(session.execution)
         if background:
             return _success(
                 {
@@ -172,6 +210,7 @@ class AgentTool:
                     "task_id": task_id,
                     "poll_again": False,
                     "completion_notification": True,
+                    "execution": execution,
                 },
                 "子 Agent 已在后台启动",
                 metadata=_finish_turn_metadata(
@@ -207,6 +246,7 @@ class AgentTool:
                     "task_id": task_id,
                     "poll_again": False,
                     "completion_notification": True,
+                    "execution": execution,
                 },
                 "子 Agent 已转入后台",
                 metadata=_finish_turn_metadata(
@@ -220,6 +260,7 @@ class AgentTool:
             "status": snapshot.status,
             "task_id": task_id,
             "result": snapshot.result,
+            "execution": execution,
         }
         if snapshot.error:
             payload["error"] = snapshot.error
@@ -370,9 +411,22 @@ class TaskStopTool:
 
     def execute_prepared(self, arguments: Mapping[str, object], *, cancel_event=None) -> ToolExecution:
         del cancel_event
-        requested = self.manager.stop(str(arguments["task_id"]))
+        task_id = str(arguments["task_id"])
+        requested = self.manager.stop(task_id)
         status = "cancellation_requested" if requested else "already_finished"
-        return _success({"ok": True, "status": status}, "已处理子 Agent 取消请求")
+        snapshot = self.manager.get(task_id)
+        return _success(
+            {
+                "ok": True,
+                "status": status,
+                "execution": (
+                    dict(snapshot.execution)
+                    if snapshot is not None
+                    else {"isolation": "shared"}
+                ),
+            },
+            "已处理子 Agent 取消请求",
+        )
 
 
 class SendMessageTool:
@@ -418,6 +472,7 @@ class SendMessageTool:
     def execute_prepared(self, arguments: Mapping[str, object], *, cancel_event=None) -> ToolExecution:
         del cancel_event
         task_id = self.manager.send_message(str(arguments["name"]), str(arguments["message"]))
+        snapshot = self.manager.get(task_id)
         return _success(
             {
                 "ok": True,
@@ -426,6 +481,11 @@ class SendMessageTool:
                 "task_id": task_id,
                 "poll_again": False,
                 "completion_notification": True,
+                "execution": (
+                    _compact_execution(snapshot.execution)
+                    if snapshot is not None
+                    else {"isolation": "shared"}
+                ),
             },
             "已向子 Agent 续派任务",
             metadata=_finish_turn_metadata(
@@ -472,6 +532,11 @@ def _task_payload(snapshot: TaskSnapshot, *, include_result: bool) -> dict[str, 
         "last_activity": snapshot.last_activity,
         "conversation_id": snapshot.conversation_id,
         "profile": snapshot.profile_name,
+        "execution": (
+            dict(snapshot.execution)
+            if include_result
+            else _compact_execution(snapshot.execution)
+        ),
     }
     if include_result:
         payload["result"] = snapshot.result
@@ -515,3 +580,13 @@ def _error(code: str, message: str) -> ToolExecution:
 
 def _json(payload: Mapping[str, object]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _compact_execution(execution: Mapping[str, object]) -> dict[str, object]:
+    if execution.get("isolation") != "worktree":
+        return {"isolation": "shared"}
+    branch = execution.get("branch")
+    return {
+        "isolation": "worktree",
+        **({"branch": branch} if isinstance(branch, str) else {}),
+    }

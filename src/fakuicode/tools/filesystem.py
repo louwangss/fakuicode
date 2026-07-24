@@ -59,7 +59,7 @@ class ReadFileTool:
         numbered = "".join(f"{number}: {line}" for number, line in enumerate(content.splitlines(keepends=True), start=1))
         if content and not numbered:
             numbered = "1: "
-        return ToolExecution(True, numbered, f"read {path.relative_to(self.policy.workspace).as_posix()}")
+        return ToolExecution(True, numbered, f"read {self.policy.relative_target(path)}")
 
 
 class WriteFileTool:
@@ -244,7 +244,7 @@ class SearchCodeTool:
             if monotonic() >= deadline or len(matches) >= _MAX_MATCHES:
                 limited = True
                 break
-            if _is_ignored_discovery_path(path, self.policy.workspace):
+            if _is_ignored_discovery_path(path, self.policy):
                 continue
             try:
                 safe_path = self.policy.resolve_path(str(path))
@@ -255,7 +255,7 @@ class SearchCodeTool:
                 continue
             for line_number, line in enumerate(content.splitlines(), start=1):
                 if query in line:
-                    relative = safe_path.relative_to(self.policy.workspace).as_posix()
+                    relative = self.policy.relative_target(safe_path)
                     matches.append(f"{relative}:{line_number}: {line}")
                     if len(matches) >= _MAX_MATCHES:
                         limited = True
@@ -351,10 +351,10 @@ def _matching_paths(policy: WorkspacePolicy, candidates: Iterable[Path | None]) 
             safe_path = policy.resolve_path(str(candidate))
         except ToolPolicyError:
             continue
-        if _is_ignored_discovery_path(safe_path, policy.workspace):
+        if _is_ignored_discovery_path(safe_path, policy):
             continue
         if safe_path.is_file():
-            matches.append(safe_path.relative_to(policy.workspace).as_posix())
+            matches.append(policy.relative_target(safe_path))
     return matches, monotonic() >= deadline or len(matches) >= _MAX_MATCHES
 
 
@@ -367,12 +367,19 @@ def _candidate_files(scope: Path) -> Iterable[Path]:
         raise ToolExecutionError("Unable to search the requested workspace scope.") from error
 
 
-def _is_ignored_discovery_path(path: Path, workspace: Path) -> bool:
+def _is_ignored_discovery_path(path: Path, policy: WorkspacePolicy) -> bool:
     try:
-        relative = path.relative_to(workspace)
-    except ValueError:
+        relative = Path(policy.relative_target(path))
+    except (ValueError, ToolPolicyError):
         return True
-    return any(part.casefold() in _IGNORED_DISCOVERY_DIRECTORIES for part in relative.parts)
+    folded = tuple(part.casefold() for part in relative.parts)
+    return (
+        any(part in _IGNORED_DISCOVERY_DIRECTORIES for part in folded)
+        or folded[:2] in {
+            (".fakuicode", "worktrees"),
+            (".fakuicode", "worktree-state"),
+        }
+    )
 
 
 def _read_text(path: Path) -> str:

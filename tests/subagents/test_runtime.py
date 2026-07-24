@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from pathlib import Path
+import subprocess
+import sys
 
 from fakuicode.models import (
     AgentMessage,
@@ -24,6 +26,7 @@ from fakuicode.subagents.models import (
 )
 from fakuicode.tools.policy import WorkspacePolicy
 from fakuicode.tools.registry import ToolRegistry
+from fakuicode.worktrees.manager import WorktreeManager
 
 
 class TextProvider:
@@ -76,6 +79,32 @@ def _definition(
         tools=("read_file", "find_files", "search_code"),
         permission_mode=permission_mode,
     )
+
+
+def _git(cwd: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    return completed.stdout.strip()
+
+
+def _repository(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init")
+    _git(repo, "config", "user.name", "Runtime Tests")
+    _git(repo, "config", "user.email", "runtime@example.test")
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "base")
+    return repo
 
 
 def test_defined_runtime_starts_clean_with_role_prompt_and_filtered_tools(tmp_path: Path) -> None:
@@ -291,3 +320,97 @@ def test_fork_runtime_requires_a_successful_parent_request(tmp_path: Path) -> No
 
     with pytest.raises(ChildRuntimeError, match="成功请求"):
         factory.create_fork()
+
+
+def test_worktree_runtime_rebinds_tools_and_instructions_but_keeps_parent_storage(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.subagents.runtime import ChildRuntimeFactory
+
+    repo = _repository(tmp_path)
+    store = ConversationStore(tmp_path / "store.sqlite3")
+    parent = store.create_conversation("Main", repo, "default")
+    permissions = PermissionManager(
+        PermissionConfigSnapshot(),
+        DangerousCommandGuard(repo),
+    )
+    seen_contexts = []
+    providers: list[TextProvider] = []
+
+    def provider_factory(config: ProviderConfig) -> TextProvider:
+        provider = TextProvider(config)
+        providers.append(provider)
+        return provider
+
+    def registry_factory(child_permissions, execution_context):
+        seen_contexts.append(execution_context)
+        assert execution_context is not None
+        return ToolRegistry(
+            WorkspacePolicy(
+                execution_context.execution_workspace,
+                mappings=execution_context.mappings,
+            ),
+            permission_manager=child_permissions,
+        )
+
+    factory = ChildRuntimeFactory(
+        store=store,
+        parent_conversation_id=parent.id,
+        workspace=repo,
+        profiles=ProfileSet({"default": _config()}, "default"),
+        active_profile_name="default",
+        provider_factory=provider_factory,
+        tool_registry_factory=registry_factory,
+        parent_permissions=permissions,
+        worktree_manager=WorktreeManager(repo),
+        project_instruction_provider=lambda workspace: f"instructions:{workspace}",
+    )
+    definition = AgentDefinition(
+        "explore",
+        "探索代码",
+        "role sentinel",
+        AgentSource.PROJECT,
+        repo / "explore.md",
+        tools=("read_file",),
+        isolation="worktree",
+    )
+
+    child = factory.create_defined(definition)
+    outcome = child.run_to_completion("inspect")
+
+    context = seen_contexts[0]
+    assert outcome.status == "completed"
+    assert child.registry.policy.workspace == context.execution_workspace
+    assert context.execution_workspace != repo
+    assert store.get_conversation(child.conversation_id).workspace == repo.resolve()
+    request = providers[0].requests[0]
+    assert f"instructions:{context.execution_workspace}" in request.system_supplement
+    assert str(repo.resolve()) in request.system_supplement
+    assert str(context.execution_workspace) in request.system_supplement
+    assert child.execution["isolation"] == "worktree"
+    assert child.execution["status"] == "active"
+
+    worktree_root = context.worktree_root
+    from fakuicode.tools.command import RunCommandTool
+    from fakuicode.tools.filesystem import WriteFileTool
+
+    WriteFileTool(child.registry.policy).execute(
+        {"path": "README.md", "content": "child-only\n"}
+    )
+    command = RunCommandTool(child.registry.policy).execute(
+        {
+            "command": [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; print(Path.cwd())",
+            ]
+        }
+    )
+    assert "child-only" not in (repo / "README.md").read_text(encoding="utf-8")
+    assert (worktree_root / "README.md").read_text(encoding="utf-8") == "child-only\n"
+    assert str(context.execution_workspace) in command.output
+
+    child.close()
+
+    assert child.execution["status"] == "retained"
+    assert worktree_root.exists()

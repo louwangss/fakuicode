@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import inspect
 import os
 from pathlib import Path
@@ -19,7 +20,7 @@ from textual.css.query import NoMatches
 from textual.widgets import Collapsible, OptionList, Static
 
 from fakuicode.errors import PermissionPersistenceError, ProviderError, RequestCancelled
-from fakuicode.hooks.config import HookConfigRepository
+from fakuicode.hooks.config import HookConfigRepository, HookPaths
 from fakuicode.hooks.models import HookConfigSnapshot, HookEvent
 from fakuicode.hooks.runtime import HookDiagnostic, HookEngine
 from fakuicode.hooks.trust import HookTrustIdentity, HookTrustRepository, HookTrustStorageError
@@ -62,6 +63,7 @@ from fakuicode.permissions.safety import DangerousCommandGuard
 from fakuicode.providers.base import ChatProvider
 from fakuicode.providers.factory import create_provider
 from fakuicode.instructions import (
+    InstructionLoader,
     InstructionSnapshot,
     InstructionSnapshotLoader,
     sanitize_instruction_metadata,
@@ -91,6 +93,8 @@ from fakuicode.subagents.tools import (
 from fakuicode.tools.policy import WorkspacePolicy
 from fakuicode.tools.base import ToolExecution
 from fakuicode.tools.registry import ToolRegistry
+from fakuicode.worktrees.manager import WorktreeError, WorktreeManager
+from fakuicode.worktrees.models import ChildExecutionContext
 from fakuicode.tui.model_picker import (
     ConfirmationScreen,
     MemoryChoice,
@@ -248,6 +252,12 @@ class FakuicodeApp(App[None]):
     ) -> None:
         super().__init__()
         self.workspace = (workspace or Path.cwd()).resolve()
+        try:
+            self._worktree_manager: WorktreeManager | None = WorktreeManager(self.workspace)
+        except WorktreeError:
+            self._worktree_manager = None
+        self._worktree_sweep_stop = Event()
+        self._worktree_sweep_thread: Thread | None = None
         self.config = config
         self.profiles = profiles or ProfileSet({profile_name: config}, profile_name)
         self._provider_factory = provider_factory
@@ -351,14 +361,57 @@ class FakuicodeApp(App[None]):
             )
             task_manager = TaskManager(max_concurrent=self._subagent_max_concurrent)
 
-            def child_registry(child_permissions: PermissionManager) -> ToolRegistry:
+            def child_registry(
+                child_permissions: PermissionManager,
+                execution_context: ChildExecutionContext | None = None,
+            ) -> ToolRegistry:
+                child_workspace = (
+                    execution_context.execution_workspace
+                    if execution_context is not None
+                    else self.workspace
+                )
+                child_policy = WorkspacePolicy(
+                    child_workspace,
+                    mappings=(
+                        execution_context.mappings
+                        if execution_context is not None
+                        else ()
+                    ),
+                )
+                child_hook_rules = self._hook_snapshot.rules
+                if execution_context is not None:
+                    parent_paths = (
+                        self._hook_repository.paths
+                        if self._hook_repository is not None
+                        else HookPaths.for_workspace(self.workspace)
+                    )
+                    child_snapshot = HookConfigRepository(
+                        HookPaths(
+                            parent_paths.user,
+                            child_workspace / ".fakuicode" / "hooks.yaml",
+                            parent_paths.trust,
+                        ),
+                        child_workspace,
+                        project_trusted=False,
+                    ).load()
+                    child_hook_rules = tuple(
+                        rule
+                        for rule in child_snapshot.rules
+                        if rule not in child_snapshot.project_rules
+                    )
+                    if (
+                        self._hook_snapshot.project_trusted
+                        and child_snapshot.project_fingerprint
+                        == self._hook_snapshot.project_fingerprint
+                    ):
+                        child_hook_rules += child_snapshot.project_rules
                 child_hooks = HookEngine(
-                    self._hook_snapshot.rules,
+                    child_hook_rules,
                     diagnostic_sink=self._record_hook_diagnostic,
-                    workspace=self.workspace,
+                    workspace=child_workspace,
                 )
                 return ToolRegistry(
-                    policy,
+                    child_policy,
                     permission_manager=child_permissions,
                     hook_engine=child_hooks,
                 )
@@ -379,6 +432,11 @@ class FakuicodeApp(App[None]):
                     "last_successful_request",
                     None,
                 ),
+                worktree_manager=self._worktree_manager,
+                project_instruction_provider=lambda child_workspace: InstructionLoader(
+                    child_workspace
+                ).load().text,
+                memory_service=self.memory_service,
             )
             agent_tool = AgentTool(
                 self._agent_catalog,
@@ -491,6 +549,7 @@ class FakuicodeApp(App[None]):
         yield PromptPanel(self.config.model, command_registry=self._command_registry, id="prompt-panel")
 
     def on_mount(self) -> None:
+        self._start_worktree_sweeper()
         conversation = self.query_one("#conversation", VerticalScroll)
         conversation.mount(BrandPanel(self.config, str(self.workspace)))
         for diagnostic in self._permission_snapshot.diagnostics:
@@ -712,6 +771,7 @@ class FakuicodeApp(App[None]):
 
     def on_unmount(self) -> None:
         self._is_closing = True
+        self._stop_worktree_sweeper()
         if self._task_manager is not None:
             self._task_manager.close()
             self._task_manager = None
@@ -731,6 +791,38 @@ class FakuicodeApp(App[None]):
         if self._skill_install_cancel_event is not None:
             self._skill_install_cancel_event.set()
         self._skill_install_broker.close()
+
+    def _start_worktree_sweeper(self) -> None:
+        if self._worktree_manager is None or self._worktree_sweep_thread is not None:
+            return
+        self._worktree_sweep_stop.clear()
+        self._worktree_sweep_thread = Thread(
+            target=self._run_worktree_sweeper,
+            name="fakuicode-worktree-sweeper",
+            daemon=True,
+        )
+        self._worktree_sweep_thread.start()
+
+    def _stop_worktree_sweeper(self) -> None:
+        self._worktree_sweep_stop.set()
+        thread = self._worktree_sweep_thread
+        if thread is not None:
+            thread.join()
+        self._worktree_sweep_thread = None
+
+    def _run_worktree_sweeper(self) -> None:
+        manager = self._worktree_manager
+        if manager is None:
+            return
+        while not self._worktree_sweep_stop.is_set():
+            try:
+                manager.sweep_stale(
+                    datetime.now(timezone.utc) - timedelta(days=30)
+                )
+            except (OSError, WorktreeError):
+                pass
+            if self._worktree_sweep_stop.wait(24 * 60 * 60):
+                return
 
     def on_prompt_editor_submitted(self, message: PromptEditor.Submitted) -> None:
         if self._active_turn is not None:
@@ -1856,6 +1948,7 @@ class FakuicodeApp(App[None]):
                 status=snapshot.status,
                 result=snapshot.result,
                 error=snapshot.error,
+                execution=snapshot.execution,
             )
             self.query_one("#conversation", VerticalScroll).mount(
                 SubagentResultNotice(
