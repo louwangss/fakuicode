@@ -33,5 +33,5 @@ jobs:
         id: tests
         run: python -m pytest -q --junitxml=pytest-results.xml
       - name: Report test failures
-        if: steps.tests.outcome == 'failure'
+        if: failure() && steps.tests.outcome == 'failure'
         run: python .github/scripts/report_pytest_failures.py pytest-results.xml
