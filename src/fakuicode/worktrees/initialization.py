@@ -108,17 +108,17 @@ class WorktreeInitializer:
             )
         except GitCommandError:
             return False
-        if unstaged != 0 or staged != 0 or ordinary:
+        if unstaged != 0 or staged != 0:
             return False
         copy_paths = {record["path"] for record in copies if isinstance(record, dict)}
         link_paths = {record["path"] for record in links if isinstance(record, dict)}
-        unknown_ignored = {
+        unknown_paths = {
             item
-            for item in ignored
+            for item in (*ordinary, *ignored)
             if item not in copy_paths
             and not any(item == link or item.startswith(f"{link}/") for link in link_paths)
         }
-        return not unknown_ignored
+        return not unknown_paths
 
     def inventory_contract_valid(self, inventory: object) -> bool:
         """Validate untrusted sidecar records without requiring assets to be unchanged."""

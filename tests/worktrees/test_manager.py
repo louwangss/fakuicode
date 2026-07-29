@@ -10,6 +10,7 @@ from uuid import UUID
 import pytest
 
 from fakuicode.worktrees.git import GitRunner
+from fakuicode.worktrees.initialization import WorktreeInitializer
 from fakuicode.worktrees.manager import (
     WorktreeManager,
     WorktreeRecoveryConflictError,
@@ -262,6 +263,7 @@ def test_recovery_rejects_a_sidecar_inventory_path_escape(tmp_path: Path) -> Non
 
 def test_include_copy_and_dependency_link_are_initialized_and_removed_safely(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = _repository(tmp_path)
     (repo / ".gitignore").write_text(".env\nnode_modules/\n", encoding="utf-8")
@@ -288,6 +290,21 @@ def test_include_copy_and_dependency_link_are_initialized_and_removed_safely(
     state = json.loads(lease.state_path.read_text(encoding="utf-8"))
     assert state["initialization"]["copies"][0]["path"] == ".env"
     assert state["initialization"]["links"][0]["path"] == "node_modules"
+
+    original_git_paths = WorktreeInitializer._git_paths
+
+    def git_paths_with_link_reported_as_ordinary(
+        initializer: WorktreeInitializer,
+        args: tuple[str, ...],
+        *,
+        cwd: Path,
+    ) -> tuple[str, ...]:
+        paths = original_git_paths(initializer, args, cwd=cwd)
+        if args == ("ls-files", "--others", "--exclude-standard", "-z", "--"):
+            return tuple(dict.fromkeys((*paths, "node_modules")))
+        return paths
+
+    monkeypatch.setattr(WorktreeInitializer, "_git_paths", git_paths_with_link_reported_as_ordinary)
 
     report = manager.release(lease)
 
