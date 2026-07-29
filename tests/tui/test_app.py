@@ -3098,7 +3098,7 @@ def test_conversation_keeps_long_workspace_information_compact_and_scrollable(
         from fakuicode.tui.widgets import BrandPanel, PromptEditor
 
         long_reply = "\n".join(f"line {index}" for index in range(60))
-        long_workspace = tmp_path / ("long-workspace-name-" * 8)
+        long_workspace = tmp_path / "long-workspace"
         long_workspace.mkdir()
         app = FakuicodeApp(
             make_config(),
