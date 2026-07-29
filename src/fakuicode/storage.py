@@ -8,9 +8,10 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import sqlite3
-from threading import RLock
+from threading import Lock, RLock
 from time import time_ns
 from uuid import UUID, uuid4
+from weakref import WeakValueDictionary
 
 from fakuicode.models import TimelineEvent, TimelineEventKind
 
@@ -40,6 +41,18 @@ _DIAGNOSTIC_ENUM_FIELDS = {
 }
 _SUMMARY_TRIGGERS = {"automatic", "manual", "emergency"}
 DEFAULT_CONVERSATION_TITLE = "New conversation"
+_DATABASE_LOCKS_GUARD = Lock()
+_DATABASE_LOCKS: WeakValueDictionary[Path, RLock] = WeakValueDictionary()
+
+
+def _database_lock(database_path: Path) -> RLock:
+    key = database_path.resolve()
+    with _DATABASE_LOCKS_GUARD:
+        lock = _DATABASE_LOCKS.get(key)
+        if lock is None:
+            lock = RLock()
+            _DATABASE_LOCKS[key] = lock
+        return lock
 
 
 @dataclass(frozen=True)
@@ -69,7 +82,7 @@ class ConversationStore:
 
     def __init__(self, database_path: Path) -> None:
         database_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = RLock()
+        self._lock = _database_lock(database_path)
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._initialize()
