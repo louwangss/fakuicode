@@ -960,7 +960,8 @@ def test_permission_prompt_denies_without_leaking_content_and_agent_continues(tm
             await pilot.press("enter")
             for _ in range(40):
                 await pilot.pause()
-                if list(app.query(PermissionPrompt)):
+                prompts = list(app.query(PermissionPrompt))
+                if prompts and prompts[0].query_one(OptionList).highlighted == 0:
                     break
 
             prompt = app.query_one(PermissionPrompt)
@@ -3525,7 +3526,8 @@ def test_project_skill_script_prompts_for_fingerprint_trust_before_registration(
             await pilot.press("enter")
             for _ in range(60):
                 await pilot.pause()
-                if list(app.query(SkillTrustPrompt)):
+                prompts = list(app.query(SkillTrustPrompt))
+                if prompts and prompts[0].query_one(OptionList).highlighted == 1:
                     break
             prompt = app.query_one(SkillTrustPrompt)
             assert prompt.query_one(OptionList).highlighted == 1
