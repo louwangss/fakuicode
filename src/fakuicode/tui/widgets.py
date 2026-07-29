@@ -117,7 +117,9 @@ class BrandPanel(Static):
                     config.model,
                     working_directory,
                 )
-            )
+            ),
+            no_wrap=True,
+            overflow="ellipsis",
         )
         self._brand_logo = _render_brand_logo()
 

@@ -3087,7 +3087,9 @@ def test_provider_error_preserves_completed_turns_before_and_after_recovery() ->
     asyncio.run(run())
 
 
-def test_conversation_contains_startup_information_that_scrolls_with_messages() -> None:
+def test_conversation_keeps_long_workspace_information_compact_and_scrollable(
+    tmp_path: Path,
+) -> None:
     async def run() -> None:
         from textual.containers import VerticalScroll
 
@@ -3096,9 +3098,12 @@ def test_conversation_contains_startup_information_that_scrolls_with_messages() 
         from fakuicode.tui.widgets import BrandPanel, PromptEditor
 
         long_reply = "\n".join(f"line {index}" for index in range(60))
+        long_workspace = tmp_path / ("long-workspace-name-" * 8)
+        long_workspace.mkdir()
         app = FakuicodeApp(
             make_config(),
             provider=FakeProvider([[StreamEvent("text_delta", long_reply), StreamEvent("completed")]]),
+            workspace=long_workspace,
         )
 
         async with app.run_test(size=(48, 16)) as pilot:
