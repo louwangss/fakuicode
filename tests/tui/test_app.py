@@ -92,6 +92,7 @@ class SlowTextProvider:
 
     def __init__(self) -> None:
         self.started = Event()
+        self.release = Event()
         self.finished = Event()
 
     def stream_chat(self, messages: Sequence[object]) -> Iterator[object]:
@@ -101,6 +102,7 @@ class SlowTextProvider:
             yield StreamEvent("text_delta", f"line {index}\n")
             if index == 40:
                 self.started.set()
+                self.release.wait()
             sleep(0.01)
         self.finished.set()
         yield StreamEvent("completed")
@@ -3264,12 +3266,18 @@ def test_gradually_streamed_text_reflows_and_follows_before_completion() -> None
                     break
 
             assert provider.started.is_set()
-            await asyncio.sleep(0.15)
-            conversation = app.query_one("#conversation", VerticalScroll)
-            assert provider.finished.is_set() is False
-            assert editor.disabled is True
-            assert conversation.max_scroll_y > 0
-            assert conversation.scroll_y == conversation.max_scroll_y
+            try:
+                conversation = app.query_one("#conversation", VerticalScroll)
+                for _ in range(20):
+                    await pilot.pause()
+                    if conversation.max_scroll_y > 0:
+                        break
+                assert provider.finished.is_set() is False
+                assert editor.disabled is True
+                assert conversation.max_scroll_y > 0
+                assert conversation.scroll_y == conversation.max_scroll_y
+            finally:
+                provider.release.set()
 
             for _ in range(40):
                 await pilot.pause()
