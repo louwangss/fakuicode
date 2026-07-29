@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Mapping
 
 
@@ -104,6 +105,7 @@ class ResolvedStdioServerConfig:
     environment: Mapping[str, SecretText] = field(repr=False)
     enabled_tools: frozenset[str] | None = None
     disabled_tools: frozenset[str] = frozenset()
+    working_directory: Path | None = None
 
     @property
     def transport(self) -> McpTransportType:
@@ -153,11 +155,16 @@ class McpTrustRequest:
     identity: McpServerIdentity
     transport: McpTransportType
     command: str | None = None
-    argument_count: int = 0
+    arguments: tuple[str, ...] = field(default=(), repr=False)
+    working_directory: Path | None = None
     redacted_url: str | None = None
     environment_names: tuple[str, ...] = ()
     header_names: tuple[str, ...] = ()
     referenced_variable_names: tuple[str, ...] = ()
+
+    @property
+    def argument_count(self) -> int:
+        return len(self.arguments)
 
 
 @dataclass(frozen=True)

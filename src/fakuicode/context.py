@@ -388,7 +388,31 @@ def build_tool_result_preview(
 
     if original_tokens < 0 or budget_tokens < 1:
         raise ValueError("Token counts must be non-negative and the preview budget must be positive.")
-    original_bytes = len(output.encode("utf-8"))
+    return build_stored_tool_result_preview(
+        head=output,
+        tail=output,
+        original_bytes=len(output.encode("utf-8")),
+        original_tokens=original_tokens,
+        success=success,
+        read_path=read_path,
+        budget_tokens=budget_tokens,
+    )
+
+
+def build_stored_tool_result_preview(
+    *,
+    head: str,
+    tail: str,
+    original_bytes: int,
+    original_tokens: int,
+    success: bool,
+    read_path: str,
+    budget_tokens: int,
+) -> str:
+    """Build a bounded preview from already-bounded artifact edges."""
+
+    if original_bytes < 0 or original_tokens < 0 or budget_tokens < 1:
+        raise ValueError("Sizes must be non-negative and the preview budget must be positive.")
     metadata = (
         "[工具结果已外置]\n"
         f"状态：{'成功' if success else '失败'}\n"
@@ -403,9 +427,9 @@ def build_tool_result_preview(
     head_bytes = available_bytes // 2
     tail_bytes = available_bytes - head_bytes
     while True:
-        head = _utf8_prefix(output, head_bytes)
-        tail = _utf8_suffix(output, tail_bytes)
-        preview = f"{metadata}--- 开头 ---\n{head}\n--- 结尾 ---\n{tail}"
+        visible_head = _utf8_prefix(head, head_bytes)
+        visible_tail = _utf8_suffix(tail, tail_bytes)
+        preview = f"{metadata}--- 开头 ---\n{visible_head}\n--- 结尾 ---\n{visible_tail}"
         excess = approximate_token_count(preview) - budget_tokens
         if excess <= 0:
             return preview

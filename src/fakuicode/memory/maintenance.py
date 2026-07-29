@@ -143,17 +143,22 @@ class MemoryMaintenanceRunner:
 
     def _call(self, config: ProviderConfig, system_prompt: str, user_payload: str) -> str:
         provider = self.provider_factory(config)
-        request = AgentRequest(
-            (AgentMessage("user", user_payload),),
-            (),
-            system_prompt=system_prompt,
-            system_supplement="",
-            output_token_limit=self.limits.maintenance_output_token_limit,
-        )
-        return _collect_structured_stream(
-            invoke_provider_stream(provider, request),
-            max_bytes=self.limits.maintenance_output_max_bytes,
-        )
+        try:
+            request = AgentRequest(
+                (AgentMessage("user", user_payload),),
+                (),
+                system_prompt=system_prompt,
+                system_supplement="",
+                output_token_limit=self.limits.maintenance_output_token_limit,
+            )
+            return _collect_structured_stream(
+                invoke_provider_stream(provider, request),
+                max_bytes=self.limits.maintenance_output_max_bytes,
+            )
+        finally:
+            close_provider = getattr(provider, "close", None)
+            if callable(close_provider):
+                close_provider()
 
     def _minimal_input(self, job: MaintenanceJob) -> str | None:
         turn = job.turn

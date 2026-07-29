@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from math import isfinite
 from queue import Empty, SimpleQueue
 from threading import Condition, Event, RLock
 from time import monotonic, time_ns
 from typing import Literal, Mapping, Protocol
 from uuid import uuid4
 
+from fakuicode.lifecycle import (
+    DEFAULT_COOPERATIVE_SHUTDOWN_GRACE_SECONDS,
+    DaemonFutureExecutor,
+)
 from fakuicode.models import TokenUsage
 from fakuicode.subagents.runtime import ChildRunResult
 
@@ -68,6 +72,13 @@ class TaskSnapshot:
     execution: Mapping[str, object]
 
 
+@dataclass(frozen=True)
+class TaskManagerCloseReport:
+    """Tasks still executing after cooperative, bounded shutdown."""
+
+    detached_task_ids: tuple[str, ...] = ()
+
+
 @dataclass
 class _TaskRun:
     id: str
@@ -86,21 +97,31 @@ class _TaskRun:
 
 
 class TaskManager:
-    def __init__(self, *, max_concurrent: int = 2) -> None:
+    def __init__(
+        self,
+        *,
+        max_concurrent: int = 2,
+        shutdown_grace_seconds: float = DEFAULT_COOPERATIVE_SHUTDOWN_GRACE_SECONDS,
+    ) -> None:
         if max_concurrent < 1:
             raise ValueError("max_concurrent must be positive")
-        self._executor = ThreadPoolExecutor(
+        if not isfinite(shutdown_grace_seconds) or shutdown_grace_seconds < 0:
+            raise ValueError("shutdown_grace_seconds must be finite and non-negative")
+        self._workers = DaemonFutureExecutor(
             max_workers=max_concurrent,
             thread_name_prefix="fakuicode-subagent",
         )
+        self._shutdown_grace_seconds = shutdown_grace_seconds
         self._tasks: dict[str, _TaskRun] = {}
         self._sessions: dict[str, ManagedChildSession] = {}
         self._names: dict[str, str] = {}
         self._done: SimpleQueue[str] = SimpleQueue()
         self._notifications: SimpleQueue[str] = SimpleQueue()
+        self._closed_sessions: set[str] = set()
         self._lock = RLock()
         self._changed = Condition(self._lock)
         self._closed = False
+        self._close_report = TaskManagerCloseReport()
 
     def launch(
         self,
@@ -143,7 +164,7 @@ class TaskManager:
                 notify_on_done=notify_on_done,
             )
             self._tasks[task_id] = task
-            self._executor.submit(self._run, task_id)
+            self._workers.submit(self._run, task_id)
             self._changed.notify_all()
         if superseded is not None:
             try:
@@ -279,19 +300,40 @@ class TaskManager:
             except Empty:
                 return tuple(items)
 
-    def close(self) -> None:
+    def close(self) -> TaskManagerCloseReport:
         with self._changed:
             if self._closed:
-                return
+                return self._close_report
             self._closed = True
             sessions = tuple(self._sessions.values())
             for task in self._tasks.values():
                 if task.status not in _TERMINAL:
-                    task.status = "cancelling"
                     task.session.cancel()
+                    if task.status == "queued":
+                        task.status = "cancelled"
+                        task.error = "子 Agent 在启动前已取消。"
+                        task.end_time_ns = time_ns()
+                        self._finish(task)
+                    else:
+                        task.status = "cancelling"
             self._changed.notify_all()
-        self._executor.shutdown(wait=True, cancel_futures=False)
+        self._workers.shutdown(
+            wait=True,
+            timeout=self._shutdown_grace_seconds,
+        )
+        with self._changed:
+            detached = tuple(
+                task.id for task in self._tasks.values() if task.status not in _TERMINAL
+            )
+            self._close_report = TaskManagerCloseReport(detached)
+            detached_sessions = {
+                task.session.id
+                for task in self._tasks.values()
+                if task.id in detached
+            }
         for session in sessions:
+            if session.id in detached_sessions:
+                continue
             latest = next(
                 (
                     task.status
@@ -300,22 +342,38 @@ class TaskManager:
                 ),
                 "completed",
             )
-            try:
-                session.close(
-                    status=(
-                        "cancelled"
-                        if latest == "cancelled"
-                        else "error"
-                        if latest == "failed"
-                        else "completed"
-                    )
-                )
-            except Exception:
-                continue
+            self._close_session_once(
+                session,
+                status=(
+                    "cancelled"
+                    if latest == "cancelled"
+                    else "error"
+                    if latest == "failed"
+                    else "completed"
+                ),
+            )
+        return self._close_report
+
+    def _close_session_once(
+        self,
+        session: ManagedChildSession,
+        *,
+        status: str,
+    ) -> None:
+        with self._lock:
+            if session.id in self._closed_sessions:
+                return
+            self._closed_sessions.add(session.id)
+        try:
+            session.close(status=status)
+        except Exception:
+            pass
 
     def _run(self, task_id: str) -> None:
         with self._changed:
             task = self._tasks[task_id]
+            if task.status in _TERMINAL:
+                return
             if task.status == "cancelling":
                 task.status = "cancelled"
                 task.end_time_ns = time_ns()
@@ -333,14 +391,32 @@ class TaskManager:
                 "子 Agent 运行时发生内部错误",
             )
         with self._changed:
+            cancellation_requested = task.status == "cancelling"
             task.result = outcome.text
-            task.error = outcome.error
+            task.error = (
+                outcome.error or "子 Agent 已取消。"
+                if cancellation_requested
+                else outcome.error
+            )
             task.usage = outcome.usage
             task.tool_count = outcome.tool_count
             task.last_activity = outcome.last_activity
-            task.status = outcome.status
+            task.status = "cancelled" if cancellation_requested else outcome.status
             task.end_time_ns = time_ns()
             self._finish(task)
+            close_after_detach = self._closed
+            final_status = task.status
+        if close_after_detach:
+            self._close_session_once(
+                task.session,
+                status=(
+                    "cancelled"
+                    if final_status == "cancelled"
+                    else "error"
+                    if final_status == "failed"
+                    else "completed"
+                ),
+            )
 
     def _finish(self, task: _TaskRun) -> None:
         self._done.put(task.id)

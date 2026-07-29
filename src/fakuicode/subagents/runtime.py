@@ -8,10 +8,10 @@ import inspect
 from pathlib import Path
 from threading import Event, Lock
 from typing import Literal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fakuicode.agent import MAX_ITERATIONS
-from fakuicode.models import AgentMessage, AgentStreamEvent, ProfileSet, ProviderConfig, TokenUsage
+from fakuicode.models import AgentStreamEvent, ProfileSet, ProviderConfig, TokenUsage
 from fakuicode.permissions.manager import (
     ApprovalHandler,
     PermissionManager,
@@ -23,6 +23,7 @@ from fakuicode.prompting import build_request_envelope
 from fakuicode.providers.base import AgentRequest
 from fakuicode.session import AgentSessionController
 from fakuicode.storage import ConversationStore
+from fakuicode.tool_scheduler import ReadOnlyToolScheduler
 from fakuicode.subagents.models import AgentDefinition, PermissionBehavior
 from fakuicode.tools.registry import ToolRegistry
 from fakuicode.worktrees.manager import (
@@ -157,6 +158,7 @@ class ChildAgentSession:
         task_prefix: str = "",
         execution_context: ChildExecutionContext | None = None,
         worktree_manager: WorktreeManager | None = None,
+        owns_worktree_lease: bool = True,
     ) -> None:
         self.id = session_id
         self.name = name
@@ -169,6 +171,7 @@ class ChildAgentSession:
         self.task_prefix = task_prefix.strip()
         self.execution_context = execution_context
         self.worktree_manager = worktree_manager
+        self.owns_worktree_lease = owns_worktree_lease
         self.release_report: WorktreeReleaseReport | None = None
         self._run_lock = Lock()
         self._cancel_event: Event | None = None
@@ -226,7 +229,11 @@ class ChildAgentSession:
             if self.store is not None:
                 self.store.update_conversation_status(self.conversation_id, status)
         finally:
-            if self.execution_context is not None and self.worktree_manager is not None:
+            if (
+                self.execution_context is not None
+                and self.worktree_manager is not None
+                and self.owns_worktree_lease
+            ):
                 try:
                     self.release_report = self.worktree_manager.release(
                         self.execution_context.lease
@@ -273,6 +280,7 @@ class ChildRuntimeFactory:
         worktree_manager: WorktreeManager | None = None,
         project_instruction_provider: Callable[[Path], str] | None = None,
         memory_service: object | None = None,
+        read_only_scheduler: ReadOnlyToolScheduler | None = None,
     ) -> None:
         self.store = store
         self.parent_conversation_id = parent_conversation_id
@@ -288,6 +296,7 @@ class ChildRuntimeFactory:
         self.worktree_manager = worktree_manager
         self.project_instruction_provider = project_instruction_provider
         self.memory_service = memory_service
+        self.read_only_scheduler = read_only_scheduler
 
     def create_defined(
         self,
@@ -296,6 +305,12 @@ class ChildRuntimeFactory:
         profile_override: str | None = None,
         name: str | None = None,
         isolation: str | None = None,
+        conversation_id: str | None = None,
+        create_conversation_id: str | None = None,
+        session_id: str | None = None,
+        execution_lease: WorktreeLease | None = None,
+        registry_configurator: Callable[[ToolRegistry], set[str] | None] | None = None,
+        instruction_suffix: str = "",
     ) -> ChildAgentSession:
         instance_name = name or f"{definition.name}-{str(uuid4())[:8]}"
         profile_name = profile_override or definition.profile
@@ -305,32 +320,58 @@ class ChildRuntimeFactory:
             config = self.profiles.get(profile_name)
         except KeyError as error:
             raise ChildRuntimeError(f"Profile '{profile_name}' 不存在") from error
+        if conversation_id is not None and create_conversation_id is not None:
+            raise ChildRuntimeError("不能同时恢复和创建指定 ID 的成员会话")
+        if execution_lease is not None and (
+            isolation == "worktree" or definition.isolation == "worktree"
+        ):
+            raise ChildRuntimeError("外部任务 Worktree 不能与自动 Worktree 隔离同时使用")
         effective_isolation = (
             "worktree"
             if isolation == "worktree" or definition.isolation == "worktree"
             else None
         )
-        session_uuid = uuid4()
-        lease = self._create_worktree(
+        try:
+            session_uuid = UUID(session_id) if session_id is not None else uuid4()
+        except (ValueError, AttributeError) as error:
+            raise ChildRuntimeError("session_id 必须是 UUID") from error
+        owns_worktree_lease = execution_lease is None
+        lease = execution_lease or self._create_worktree(
             WorktreeIdentity.for_role(session_uuid, definition.name),
             effective_isolation,
         )
-        conversation_id = str(uuid4())
+        restored_conversation_id = conversation_id
+        conversation_id = restored_conversation_id or create_conversation_id or str(uuid4())
         conversation_created = False
         try:
             if self.store is not None:
                 if self.parent_conversation_id is None:
                     raise ChildRuntimeError("持久化子 Agent 缺少父会话")
-                child = self.store.create_conversation(
-                    f"Agent: {instance_name}",
-                    self.workspace,
-                    profile_name,
-                    conversation_type="agent",
-                    parent_conversation_id=self.parent_conversation_id,
-                    agent_name=definition.name,
-                )
+                if restored_conversation_id is None:
+                    child = self.store.create_conversation(
+                        f"Agent: {instance_name}",
+                        self.workspace,
+                        profile_name,
+                        conversation_type="agent",
+                        parent_conversation_id=self.parent_conversation_id,
+                        agent_name=definition.name,
+                        conversation_id=create_conversation_id,
+                    )
+                    conversation_created = True
+                else:
+                    child = self.store.get_conversation(restored_conversation_id)
+                    if (
+                        child.conversation_type != "agent"
+                        or child.parent_conversation_id != self.parent_conversation_id
+                        or child.agent_name != definition.name
+                        or child.profile_name != profile_name
+                        or child.workspace.resolve() != self.workspace
+                    ):
+                        raise ChildRuntimeError("成员会话与当前 Lead、角色或工作区不匹配")
+                    self.store.update_conversation_status(child.id, "active")
                 conversation_id = child.id
-                conversation_created = True
+            elif restored_conversation_id is not None:
+                raise ChildRuntimeError("无持久化存储时不能恢复成员会话")
             context = self._execution_context(lease, conversation_id)
             execution_workspace = (
                 context.execution_workspace if context is not None else self.workspace
@@ -347,6 +388,14 @@ class ChildRuntimeFactory:
             )
             registry = self._create_registry(permissions, context)
             allowed = _allowed_tools(registry, definition)
+            if registry_configurator is not None:
+                extra_tools = registry_configurator(registry) or set()
+                unknown_extra = set(extra_tools) - set(registry.all_names())
+                if unknown_extra:
+                    raise ChildRuntimeError(
+                        f"Team 注册器返回未知工具：{', '.join(sorted(unknown_extra))}"
+                    )
+                allowed.update(extra_tools)
             registry.set_visible_tools(allowed)
             project_instructions = self._instructions_for(execution_workspace)
             instructions = "\n\n".join(
@@ -356,6 +405,7 @@ class ChildRuntimeFactory:
                     _CHILD_CONTRACT,
                     _worktree_notice(context),
                     f"## 角色：{definition.name}\n\n{definition.prompt}",
+                    instruction_suffix.strip(),
                 )
                 if part
             )
@@ -382,13 +432,15 @@ class ChildRuntimeFactory:
                 memory_service=self.memory_service,
                 retry_provider_errors=False,
                 max_iterations=definition.max_turns or MAX_ITERATIONS,
+                read_only_scheduler=self.read_only_scheduler,
             )
         except Exception:
             if "registry" in locals():
                 registry.close()
             if self.store is not None and conversation_created:
                 self.store.update_conversation_status(conversation_id, "error")
-            self._release_failed_lease(lease)
+            if owns_worktree_lease:
+                self._release_failed_lease(lease)
             raise
         if definition.permission_mode is PermissionBehavior.PLAN:
             controller.mode = "plan"
@@ -403,6 +455,7 @@ class ChildRuntimeFactory:
             store=self.store,
             execution_context=context,
             worktree_manager=self.worktree_manager,
+            owns_worktree_lease=owns_worktree_lease,
         )
 
     def create_fork(
@@ -501,6 +554,7 @@ class ChildRuntimeFactory:
                 request_template=fork_template,
                 preserve_request_history=True,
                 memory_service=self.memory_service,
+                read_only_scheduler=self.read_only_scheduler,
             )
             controller.history = list(seed.messages)
         except Exception:

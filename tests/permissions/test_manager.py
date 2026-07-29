@@ -206,6 +206,111 @@ def test_read_only_task_boundary_cannot_be_approved(tmp_path: Path) -> None:
     assert handler.requests == []
 
 
+def test_session_capability_allows_only_tagged_calls_without_prompt(
+    tmp_path: Path,
+) -> None:
+    capability = "team:11111111-1111-4111-8111-111111111111:workflow"
+    handler = RecordingApprovalHandler(ApprovalChoice.DENY)
+    manager = _manager(tmp_path, handler)
+    manager.grant_session_capability(capability)
+
+    tagged = PreparedToolCall(
+        "call-tagged",
+        "team_task_create",
+        {},
+        "team:11111111-1111-4111-8111-111111111111:tasks",
+        False,
+        PermissionScope.TARGET,
+        capability,
+    )
+    untagged = PreparedToolCall(
+        "call-untagged",
+        "team_finalize",
+        {},
+        "team:11111111-1111-4111-8111-111111111111:finalize",
+        False,
+    )
+
+    allowed = manager.authorize(tagged)
+    denied = manager.authorize(untagged)
+
+    assert allowed.kind is DecisionKind.ALLOW
+    assert allowed.layer == "session_capability"
+    assert denied.kind is DecisionKind.DENY
+    assert len(handler.requests) == 1
+    manager.close()
+    assert manager.session_capabilities == ()
+
+
+def test_session_capability_cannot_override_plan_mode_or_explicit_deny(
+    tmp_path: Path,
+) -> None:
+    capability = "team:11111111-1111-4111-8111-111111111111:workflow"
+    deny = parse_rule("write_file(*)", RuleEffect.DENY, RuleSource.USER)
+    handler = RecordingApprovalHandler(ApprovalChoice.ONCE)
+    manager = _manager(
+        tmp_path,
+        handler,
+        snapshot=PermissionConfigSnapshot(user_rules=(deny,)),
+    )
+    manager.grant_session_capability(capability)
+    prepared = PreparedToolCall(
+        "call-1",
+        "write_file",
+        {},
+        "src/main.py",
+        False,
+        PermissionScope.TARGET,
+        capability,
+    )
+
+    denied = manager.authorize(prepared)
+    plan_denied = manager.authorize(prepared, read_only_task=True)
+
+    assert denied.kind is DecisionKind.DENY
+    assert denied.layer == "user_global_deny"
+    assert plan_denied.kind is DecisionKind.DENY
+    assert plan_denied.layer == "task_mode"
+    assert handler.requests == []
+
+    locked = _manager(
+        tmp_path,
+        snapshot=PermissionConfigSnapshot(
+            mode=PermissionMode.STRICT,
+            locked=True,
+        ),
+    )
+    locked.grant_session_capability(capability)
+    locked_decision = locked.authorize(prepared)
+    assert locked_decision.kind is DecisionKind.DENY
+    assert locked_decision.layer == "locked_config"
+
+
+def test_child_inherits_session_capability_without_broadening_other_tools(
+    tmp_path: Path,
+) -> None:
+    capability = "team:11111111-1111-4111-8111-111111111111:workflow"
+    parent = _manager(tmp_path)
+    parent.grant_session_capability(capability)
+    child_handler = RecordingApprovalHandler(ApprovalChoice.DENY)
+    child = parent.spawn_child(approval_handler=child_handler)
+
+    team_call = PreparedToolCall(
+        "team-call",
+        "team_message_send",
+        {},
+        "team:11111111-1111-4111-8111-111111111111:mailbox",
+        False,
+        PermissionScope.TARGET,
+        capability,
+    )
+    file_call = _prepared(target="src/main.py", call_id="file-call")
+
+    assert child.authorize(team_call).kind is DecisionKind.ALLOW
+    assert child.authorize(file_call).kind is DecisionKind.DENY
+    assert len(child_handler.requests) == 1
+
+
 def test_locked_snapshot_cannot_switch_runtime_mode(tmp_path: Path) -> None:
     manager = _manager(
         tmp_path,

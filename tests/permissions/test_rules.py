@@ -119,3 +119,24 @@ def test_dynamic_mcp_tool_rule_is_strictly_namespaced() -> None:
     assert rule.matches("__all_arguments__")
     with pytest.raises(RuleSyntaxError):
         parse_rule("mcp__Docs__lookup(*)", RuleEffect.ALLOW, RuleSource.USER)
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "team_create",
+        "team_member_start",
+        "team_task_create",
+        "team_message_send",
+        "team_integrate_task",
+        "team_finalize",
+    ],
+)
+def test_team_tools_support_explicit_permission_rules(tool_name: str) -> None:
+    rule = parse_rule(
+        f"{tool_name}(team:alpha)",
+        RuleEffect.ALLOW,
+        RuleSource.USER,
+    )
+
+    assert rule.matches("team:alpha")

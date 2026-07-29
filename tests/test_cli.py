@@ -100,6 +100,8 @@ def test_default_cli_creates_its_private_conversation_store(tmp_path, monkeypatc
             skill_user_root,
             agent_user_root,
             skill_trust_repository,
+            team_config,
+            team_home,
             ) -> None:
             self.ran = False
             assert store is not None
@@ -119,6 +121,8 @@ def test_default_cli_creates_its_private_conversation_store(tmp_path, monkeypatc
             captured["skill_user_root"] = skill_user_root
             captured["agent_user_root"] = agent_user_root
             captured["skill_trust_repository"] = skill_trust_repository
+            captured["team_config"] = team_config
+            captured["team_home"] = team_home
 
         def run(self) -> None:
             self.ran = True
@@ -145,3 +149,5 @@ def test_default_cli_creates_its_private_conversation_store(tmp_path, monkeypatc
     assert captured["memory_service"].repository.paths.root == tmp_path / "home" / ".fakuicode" / "memory"
     assert captured["memory_service"].maintenance_runner.provider_factory is captured["provider_factory"]
     assert not (tmp_path / "workspace" / ".fakuicode" / "memory").exists()
+    assert captured["team_config"].coordinator_enabled is False
+    assert captured["team_home"] == tmp_path / "home" / ".fakuicode" / "teams"

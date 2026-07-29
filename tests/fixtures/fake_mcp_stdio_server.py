@@ -51,12 +51,22 @@ for line in sys.stdin:
                             "name": "read_env",
                             "description": "Read explicit test env",
                             "inputSchema": {"type": "object"},
-                        }
+                        },
+                        {
+                            "name": "read_cwd",
+                            "description": "Read process working directory",
+                            "inputSchema": {"type": "object"},
+                        },
                     ]
                 },
             )
     elif method == "tools/call":
         name = message["params"]["name"]
         arguments = message["params"].get("arguments", {})
-        value = os.environ.get("FAKUICODE_MCP_TEST", "") if name == "read_env" else arguments.get("text", "")
+        if name == "read_env":
+            value = os.environ.get("FAKUICODE_MCP_TEST", "")
+        elif name == "read_cwd":
+            value = os.getcwd()
+        else:
+            value = arguments.get("text", "")
         respond(message["id"], {"content": [{"type": "text", "text": value}], "isError": False})

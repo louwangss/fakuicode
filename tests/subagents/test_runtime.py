@@ -229,6 +229,95 @@ def test_runtime_rejects_unknown_profile_override(tmp_path: Path) -> None:
         factory.create_defined(_definition(tmp_path), profile_override="missing")
 
 
+def test_defined_runtime_can_restore_conversation_and_add_scoped_tools(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.models import ToolDefinition
+    from fakuicode.subagents.runtime import ChildRuntimeFactory
+    from fakuicode.tools.base import ToolExecution, ToolPreparation, freeze_arguments
+
+    class TeamPingTool:
+        definition = ToolDefinition(
+            "team_ping",
+            "team scoped",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+        )
+        read_only = True
+
+        def prepare(self, arguments):
+            assert not arguments
+            return ToolPreparation(freeze_arguments({}), "team:test")
+
+        def execute_prepared(self, arguments, *, cancel_event=None):
+            del arguments, cancel_event
+            return ToolExecution(True, "pong", "pong")
+
+        def execute(self, arguments, *, cancel_event=None):
+            return self.execute_prepared(
+                self.prepare(arguments).arguments,
+                cancel_event=cancel_event,
+            )
+
+    store = ConversationStore(tmp_path / "store.sqlite3")
+    parent = store.create_conversation("Main", tmp_path, "default")
+    permissions = PermissionManager(
+        PermissionConfigSnapshot(),
+        DangerousCommandGuard(tmp_path),
+    )
+    providers: list[TextProvider] = []
+
+    def provider_factory(config: ProviderConfig) -> TextProvider:
+        provider = TextProvider(config)
+        providers.append(provider)
+        return provider
+
+    factory = ChildRuntimeFactory(
+        store=store,
+        parent_conversation_id=parent.id,
+        workspace=tmp_path,
+        profiles=ProfileSet({"default": _config()}, "default"),
+        active_profile_name="default",
+        provider_factory=provider_factory,
+        tool_registry_factory=lambda child_permissions: ToolRegistry(
+            WorkspacePolicy(tmp_path),
+            permission_manager=child_permissions,
+        ),
+        parent_permissions=permissions,
+    )
+
+    def add_team_tool(registry):
+        registry.register(TeamPingTool())
+        return {"team_ping"}
+
+    first = factory.create_defined(
+        _definition(tmp_path),
+        registry_configurator=add_team_tool,
+        instruction_suffix="team sentinel",
+    )
+    first.run_to_completion("first task")
+    conversation_id = first.conversation_id
+    first.close()
+
+    restored = factory.create_defined(
+        _definition(tmp_path),
+        conversation_id=conversation_id,
+        session_id="00000000-0000-0000-0000-000000000123",
+        registry_configurator=add_team_tool,
+        instruction_suffix="team sentinel",
+    )
+    restored.run_to_completion("second task")
+
+    assert restored.conversation_id == conversation_id
+    assert restored.id == "00000000-0000-0000-0000-000000000123"
+    assert "team_ping" in [tool.name for tool in restored.registry.definitions()]
+    assert "team sentinel" in providers[-1].requests[0].system_supplement
+    assert [message.content for message in providers[-1].requests[0].messages][-3:] == [
+        "first task",
+        "child result",
+        "second task",
+    ]
+
+
 def test_fork_runtime_reuses_parent_prompt_and_message_prefix_but_removes_control_tools(
     tmp_path: Path,
 ) -> None:

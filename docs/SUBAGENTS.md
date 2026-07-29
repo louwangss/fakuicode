@@ -75,8 +75,8 @@ background: true
 
 ## 有意不做
 
-- 不提供 Worktree 或操作系统级文件隔离。
-- 不做多 Agent 团队编排。
+- Worktree 只隔离 Git 写入，不提供操作系统级文件、进程或网络沙箱。
+- 普通 `agent` 子 Agent 不允许递归委派；长期多成员协作由独立的 Agent Team 工作流提供，见 [Agent Team 文档](AGENT_TEAMS.md)。
 - 不跨进程、跨会话持久化后台任务。
 - 不加载真实插件角色，当前仅保留来源占位。
 - 不把子 Agent 用量合并进主会话 `/status`。

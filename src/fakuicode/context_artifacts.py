@@ -4,17 +4,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import io
 import os
 from pathlib import Path
 import re
 import shutil
+from typing import BinaryIO
 from uuid import uuid4
 
 from fakuicode.context import approximate_token_count
+from fakuicode.locking import FileLockPolicy, FileLockTimeoutError, KernelFileLock
 
 
 _SAFE_CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _TOMBSTONE_NAME = re.compile(r"\.deleting-([A-Za-z0-9][A-Za-z0-9_-]{0,127})-([0-9a-f]{32})\Z")
+_EPHEMERAL_CONVERSATION_ID = re.compile(r"ephemeral-[0-9a-f]{32}\Z")
+_STAGING_LOCK_NAME = re.compile(r"\.staging-([0-9a-f]{32})\.lock\Z")
+_NONBLOCKING_LOCK_POLICY = FileLockPolicy(timeout_seconds=0)
 
 
 @dataclass(frozen=True)
@@ -64,14 +70,15 @@ class ContextArtifactStore:
         self._assert_within_workspace(target)
 
         if target.exists():
-            if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+            if self._file_sha256(target) != digest:
                 raise OSError("Existing context artifact failed its integrity check.")
             return self._reference(
                 source_sequence,
                 digest,
-                encoded,
-                target,
-                success,
+                byte_size=len(encoded),
+                estimated_tokens=approximate_token_count(output),
+                target=target,
+                success=success,
                 newly_created=False,
             )
 
@@ -89,10 +96,94 @@ class ContextArtifactStore:
         return self._reference(
             source_sequence,
             digest,
-            encoded,
-            target,
-            success,
+            byte_size=len(encoded),
+            estimated_tokens=approximate_token_count(output),
+            target=target,
+            success=success,
             newly_created=True,
+        )
+
+    def write_command_result_streams(
+        self,
+        *,
+        stdout: BinaryIO,
+        stderr: BinaryIO,
+        exit_code: int,
+        success: bool,
+    ) -> ContextArtifactRef:
+        """Stream normalized command output into a content-addressed durable artifact."""
+
+        self.conversation_dir.mkdir(parents=True, exist_ok=True)
+        self._assert_within_workspace(self.conversation_dir)
+        staging_token = uuid4().hex
+        temporary = self.conversation_dir / f".staging-{staging_token}.tmp"
+        lock_path = self.conversation_dir / f".staging-{staging_token}.lock"
+        self._assert_within_workspace(temporary)
+        self._assert_within_workspace(lock_path)
+        staging_lock = KernelFileLock(lock_path, policy=_NONBLOCKING_LOCK_POLICY)
+        staging_lock.acquire()
+        digest = hashlib.sha256()
+        byte_size = 0
+
+        def write_encoded(stream: BinaryIO, value: str) -> None:
+            nonlocal byte_size
+            encoded = value.encode("utf-8")
+            stream.write(encoded)
+            digest.update(encoded)
+            byte_size += len(encoded)
+
+        def copy_normalized(source: BinaryIO, destination: BinaryIO) -> None:
+            source.seek(0)
+            text_stream = io.TextIOWrapper(
+                source,
+                encoding="utf-8",
+                errors="replace",
+                newline=None,
+            )
+            try:
+                while True:
+                    chunk = text_stream.read(io.DEFAULT_BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    write_encoded(destination, chunk)
+            finally:
+                text_stream.detach()
+
+        try:
+            try:
+                with temporary.open("xb") as destination:
+                    write_encoded(destination, "stdout:\n")
+                    copy_normalized(stdout, destination)
+                    write_encoded(destination, "\nstderr:\n")
+                    copy_normalized(stderr, destination)
+                    write_encoded(destination, f"\nexit_code: {exit_code}")
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                content_sha256 = digest.hexdigest()
+                target = self.conversation_dir / f"command-{content_sha256}.txt"
+                self._assert_within_workspace(target)
+                if target.exists():
+                    if self._file_sha256(target) != content_sha256:
+                        raise OSError("Existing command artifact failed its integrity check.")
+                    temporary.unlink()
+                    newly_created = False
+                else:
+                    self._atomic_replace(temporary, target)
+                    newly_created = True
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
+        finally:
+            staging_lock.release()
+            lock_path.unlink(missing_ok=True)
+        return self._reference(
+            0,
+            content_sha256,
+            byte_size=byte_size,
+            estimated_tokens=(byte_size + 3) // 4,
+            target=target,
+            success=success,
+            newly_created=newly_created,
         )
 
     def resolve_read_path(self, reference: ContextArtifactRef) -> Path:
@@ -105,13 +196,110 @@ class ContextArtifactStore:
             raise ValueError("Context artifact reference must be workspace-relative.")
         candidate = self.workspace / relative
         self._assert_within_conversation(candidate)
-        try:
-            encoded = candidate.read_bytes()
-        except OSError:
-            raise
-        if hashlib.sha256(encoded).hexdigest() != reference.content_sha256:
+        if self._file_sha256(candidate) != reference.content_sha256:
             raise OSError("Context artifact failed its integrity check.")
         return candidate
+
+    def read_text_edges(
+        self,
+        reference: ContextArtifactRef,
+        *,
+        edge_bytes: int,
+    ) -> tuple[str, str]:
+        """Read bounded UTF-8 head/tail fragments after validating the artifact."""
+
+        if edge_bytes < 1:
+            raise ValueError("edge_bytes must be positive.")
+        candidate = self.resolve_read_path(reference)
+        with candidate.open("rb") as stream:
+            head = stream.read(edge_bytes).decode("utf-8", errors="ignore")
+            stream.seek(max(0, reference.byte_size - edge_bytes))
+            tail = stream.read(edge_bytes).decode("utf-8", errors="ignore")
+        return head, tail
+
+    def acquire_ephemeral_lease(self) -> KernelFileLock:
+        """Keep one non-persistent artifact directory live until its session closes."""
+
+        if _EPHEMERAL_CONVERSATION_ID.fullmatch(self.conversation_id) is None:
+            raise ValueError("Only ephemeral artifact stores can acquire a session lease.")
+        self.conversation_dir.mkdir(parents=True, exist_ok=True)
+        self._assert_direct_artifact_child(self.conversation_dir)
+        lease = KernelFileLock(
+            self.conversation_dir / ".owner.lock",
+            policy=_NONBLOCKING_LOCK_POLICY,
+        )
+        lease.acquire()
+        return lease
+
+    def cleanup_orphaned_ephemeral_artifacts(self) -> int:
+        """Delete only ephemeral directories whose prior owner lock is no longer held."""
+
+        if not self.root.exists():
+            return 0
+        cleaned = 0
+        for candidate in tuple(self.root.iterdir()):
+            if _EPHEMERAL_CONVERSATION_ID.fullmatch(candidate.name) is None:
+                continue
+            self._assert_direct_artifact_child(candidate)
+            lease_path = candidate / ".owner.lock"
+            if not lease_path.exists():
+                try:
+                    candidate.rmdir()
+                except OSError:
+                    continue
+                cleaned += 1
+                continue
+            if not lease_path.is_file() or lease_path.is_symlink():
+                continue
+            lease = KernelFileLock(lease_path, policy=_NONBLOCKING_LOCK_POLICY)
+            try:
+                lease.acquire()
+            except FileLockTimeoutError:
+                continue
+            else:
+                lease.release()
+            tombstone = self.root / f".deleting-{candidate.name}-{uuid4().hex}"
+            self._validate_tombstone(
+                tombstone,
+                require_exists=False,
+                require_current_conversation=False,
+            )
+            try:
+                os.replace(candidate, tombstone)
+            except FileNotFoundError:
+                continue
+            shutil.rmtree(tombstone)
+            cleaned += 1
+        return cleaned
+
+    def cleanup_orphaned_staging_files(self) -> int:
+        """Remove staging files only when their writer's companion lock is available."""
+
+        if not self.root.exists():
+            return 0
+        cleaned = 0
+        for directory in tuple(self.root.iterdir()):
+            if _SAFE_CONVERSATION_ID.fullmatch(directory.name) is None:
+                continue
+            self._assert_direct_artifact_child(directory)
+            if not directory.is_dir():
+                continue
+            for lock_path in tuple(directory.iterdir()):
+                match = _STAGING_LOCK_NAME.fullmatch(lock_path.name)
+                if match is None or not lock_path.is_file() or lock_path.is_symlink():
+                    continue
+                temporary = directory / f".staging-{match.group(1)}.tmp"
+                lock = KernelFileLock(lock_path, policy=_NONBLOCKING_LOCK_POLICY)
+                try:
+                    lock.acquire()
+                except FileLockTimeoutError:
+                    continue
+                else:
+                    lock.release()
+                temporary.unlink(missing_ok=True)
+                lock_path.unlink(missing_ok=True)
+                cleaned += 1
+        return cleaned
 
     def stage_conversation_deletion(self) -> Path | None:
         """Atomically hide this conversation's artifact directory before DB deletion."""
@@ -178,28 +366,48 @@ class ContextArtifactStore:
         self,
         source_sequence: int,
         digest: str,
-        encoded: bytes,
+        *,
+        byte_size: int,
+        estimated_tokens: int,
         target: Path,
         success: bool,
-        *,
         newly_created: bool,
     ) -> ContextArtifactRef:
         return ContextArtifactRef(
             conversation_id=self.conversation_id,
             source_sequence=source_sequence,
             content_sha256=digest,
-            byte_size=len(encoded),
-            estimated_tokens=approximate_token_count(encoded.decode("utf-8")),
+            byte_size=byte_size,
+            estimated_tokens=estimated_tokens,
             read_path=target.relative_to(self.workspace).as_posix(),
             success=success,
             newly_created=newly_created,
         )
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(io.DEFAULT_BUFFER_SIZE)
+                if not chunk:
+                    return digest.hexdigest()
+                digest.update(chunk)
 
     def _assert_within_workspace(self, candidate: Path) -> None:
         try:
             candidate.resolve(strict=False).relative_to(self.workspace)
         except (OSError, ValueError) as error:
             raise ValueError("Context artifact path escapes the workspace.") from error
+
+    def _assert_direct_artifact_child(self, candidate: Path) -> None:
+        self._assert_within_workspace(candidate)
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError as error:
+            raise ValueError("Context artifact directory cannot be resolved safely.") from error
+        if candidate.parent != self.root or resolved != candidate.absolute():
+            raise ValueError("Context artifact cleanup target is not a direct safe child.")
 
     def _assert_within_conversation(self, candidate: Path) -> None:
         self._assert_within_workspace(candidate)

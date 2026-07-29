@@ -16,7 +16,7 @@ from fakuicode.instructions.models import (
     InstructionScope,
     InstructionSnapshot,
 )
-from fakuicode.instructions.parser import IncludeLine, InstructionDocument, TextLine, parse_instruction_document
+from fakuicode.instructions.parser import IncludeLine, InstructionDocument, parse_instruction_document
 from fakuicode.instructions.render import render_instruction_layers
 from fakuicode.tools.policy import WorkspacePolicy
 

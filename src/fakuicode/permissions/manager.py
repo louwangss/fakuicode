@@ -144,6 +144,7 @@ class PermissionManager:
         self._repository = repository
         self._mode = snapshot.mode
         self._session_rules = list(session_rules)
+        self._session_capabilities: set[str] = set()
         self._rejected_targets: set[tuple[str, str]] = set()
         self._request_source = request_source
         self._owns_approval_handler = owns_approval_handler
@@ -164,6 +165,16 @@ class PermissionManager:
     def session_rules(self) -> tuple[Rule, ...]:
         with self._lock:
             return tuple(self._session_rules)
+
+    @property
+    def session_capabilities(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._session_capabilities))
+
+    def grant_session_capability(self, capability: str) -> None:
+        normalized = _normalize_session_capability(capability)
+        with self._lock:
+            self._session_capabilities.add(normalized)
 
     def begin_request(self) -> None:
         with self._lock:
@@ -216,7 +227,15 @@ class PermissionManager:
             if inherited is not None:
                 return inherited
         with self._lock:
-            decision = self._decide(subject, read_only_task=read_only_task)
+            preauthorized = (
+                prepared.permission_capability is not None
+                and self._has_session_capability(prepared.permission_capability)
+            )
+            decision = self._decide(
+                subject,
+                read_only_task=read_only_task,
+                preauthorized=preauthorized,
+            )
             if decision.kind is not DecisionKind.ASK:
                 return decision
             if key in self._rejected_targets:
@@ -277,15 +296,30 @@ class PermissionManager:
                 closer()
         with self._lock:
             self._session_rules.clear()
+            self._session_capabilities.clear()
             self._rejected_targets.clear()
 
-    def _decide(self, subject: PermissionSubject, *, read_only_task: bool) -> Decision:
+    def _decide(
+        self,
+        subject: PermissionSubject,
+        *,
+        read_only_task: bool,
+        preauthorized: bool,
+    ) -> Decision:
         return PermissionEngine(self._snapshot, self._guard).decide(
             subject,
             session_rules=self._session_rules,
             mode=self._mode,
             read_only_task=read_only_task,
+            preauthorized=preauthorized,
         )
+
+    def _has_session_capability(self, capability: str) -> bool:
+        with self._lock:
+            if capability in self._session_capabilities:
+                return True
+            parent = self._parent_manager
+        return parent is not None and parent._has_session_capability(capability)
 
     def _explicit_ledger_decision(
         self,
@@ -343,3 +377,14 @@ def _narrower_mode(parent: PermissionMode, requested: PermissionMode) -> Permiss
         PermissionMode.TRUSTED: 2,
     }
     return parent if rank[parent] <= rank[requested] else requested
+
+
+def _normalize_session_capability(capability: str) -> str:
+    if (
+        not isinstance(capability, str)
+        or not capability
+        or capability != capability.strip()
+        or not capability.isprintable()
+    ):
+        raise ValueError("Session capability must be one non-empty printable line.")
+    return capability

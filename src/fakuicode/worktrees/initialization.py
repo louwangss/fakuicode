@@ -39,7 +39,7 @@ class WorktreeInitializer:
 
     def initialize(self) -> tuple[dict[str, list[dict[str, Any]]], tuple[PathMapping, ...]]:
         self.inventory = {"copies": [], "links": []}
-        copies = self._copy_included_files()
+        self._copy_included_files()
         links = self._link_dependency_directories()
         mappings = tuple(
             PathMapping(

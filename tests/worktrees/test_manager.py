@@ -175,6 +175,31 @@ def test_create_and_release_an_unchanged_worktree(tmp_path: Path) -> None:
     assert json.loads(state_path.read_text(encoding="utf-8"))["status"] == "removed"
 
 
+def test_worktree_manager_can_create_from_an_explicit_base_ref(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    default_branch = _git(repo, "branch", "--show-current")
+    _git(repo, "checkout", "-b", "integration")
+    (repo / "integration.txt").write_text("integration\n", encoding="utf-8")
+    _git(repo, "add", "integration.txt")
+    _git(repo, "commit", "-m", "integration")
+    integration_sha = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", default_branch)
+    manager = WorktreeManager(repo)
+
+    lease = manager.create(
+        WorktreeIdentity.for_role(
+            UUID("00000000-0000-0000-0000-000000000888"),
+            "team-task",
+        ),
+        base_ref="integration",
+    )
+
+    assert lease.base_sha == integration_sha
+    assert (lease.execution_workspace / "integration.txt").read_text(
+        encoding="utf-8"
+    ) == "integration\n"
+
+
 def test_existing_managed_worktree_recovers_without_running_git(tmp_path: Path) -> None:
     repo = _repository(tmp_path)
     identity = WorktreeIdentity.for_fork(

@@ -1557,6 +1557,85 @@ def test_agent_runner_runs_a_contiguous_read_only_batch_concurrently_but_emits_m
     assert result_ids == ["first", "second"]
 
 
+def test_agent_runner_uses_the_shared_read_only_scheduler_budget() -> None:
+    from threading import Event, Lock, Thread
+
+    from fakuicode.agent import AgentRunner
+    from fakuicode.models import AgentMessage, AgentStreamEvent, ToolCall, ToolDefinition, ToolResult
+    from fakuicode.tool_scheduler import ReadOnlyToolScheduler
+
+    first_started = Event()
+    release_first = Event()
+    second_started = Event()
+    active = 0
+    maximum_active = 0
+    active_lock = Lock()
+
+    class Provider:
+        calls = 0
+
+        def stream_agent(self, messages, tools, *, cancel_event=None):
+            self.calls += 1
+            if self.calls == 1:
+                yield AgentStreamEvent("tool_call", tool_call=ToolCall("first", "read_file", {"path": "a"}))
+                yield AgentStreamEvent("tool_call", tool_call=ToolCall("second", "search_code", {"query": "b"}))
+            else:
+                yield AgentStreamEvent("text_delta", "done")
+            yield AgentStreamEvent("completed")
+
+    class Tools:
+        def definitions(self, *, read_only_only=False):
+            return [ToolDefinition("read_file", "Read", {}), ToolDefinition("search_code", "Search", {})]
+
+        def is_known(self, name):
+            return True
+
+        def is_read_only(self, name):
+            return True
+
+        def execute(self, call, *, cancel_event=None):
+            nonlocal active, maximum_active
+            with active_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            if call.id == "first":
+                first_started.set()
+                assert release_first.wait(timeout=1)
+            else:
+                second_started.set()
+            with active_lock:
+                active -= 1
+            return ToolResult(call.id, call.name, True, call.id, f"ran {call.name}")
+
+    scheduler = ReadOnlyToolScheduler(max_workers=1)
+    events: list[object] = []
+    worker = Thread(
+        target=lambda: events.extend(
+            AgentRunner(Provider(), Tools(), read_only_scheduler=scheduler).run(
+                [AgentMessage("user", "inspect")]
+            )
+        )
+    )
+    worker.start()
+    try:
+        assert first_started.wait(timeout=1)
+        assert not second_started.wait(timeout=0.05)
+        release_first.set()
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+        assert maximum_active == 1
+        result_ids = [
+            event.tool_result.call_id
+            for event in events
+            if getattr(event, "kind", None) == "tool_result"
+        ]
+        assert result_ids == ["first", "second"]
+    finally:
+        release_first.set()
+        scheduler.close()
+        worker.join(timeout=1)
+
+
 def test_agent_session_accumulates_exact_usage_and_marks_missing_usage_unavailable() -> None:
     from fakuicode.models import AgentStreamEvent, TokenUsage
     from fakuicode.session import AgentSessionController
@@ -1719,8 +1798,37 @@ def test_agent_session_close_releases_provider_and_permission_tools() -> None:
     provider = Provider()
     tools = Tools()
     session = AgentSessionController(provider, tools)
+    scheduler = session.read_only_scheduler
 
     session.close()
 
     assert provider.cancelled is True
     assert tools.closed is True
+    with pytest.raises(RuntimeError, match="closed"):
+        scheduler.submit(lambda: None)
+
+
+def test_agent_session_does_not_close_a_host_owned_read_only_scheduler() -> None:
+    from fakuicode.session import AgentSessionController
+    from fakuicode.tool_scheduler import ReadOnlyToolScheduler
+
+    class Provider:
+        def cancel(self) -> None:
+            pass
+
+    class Tools:
+        def close(self) -> None:
+            pass
+
+    scheduler = ReadOnlyToolScheduler(max_workers=1)
+    session = AgentSessionController(
+        Provider(),
+        Tools(),
+        read_only_scheduler=scheduler,
+    )
+
+    try:
+        session.close()
+        assert scheduler.submit(lambda: "still available").result(timeout=1) == "still available"
+    finally:
+        scheduler.close()

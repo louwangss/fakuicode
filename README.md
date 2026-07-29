@@ -1,6 +1,8 @@
 # Fakuicode
 
-Fakuicode 是一个 Python 3.11+ 的终端 Coding Agent。它提供 Textual TUI、SSE 流式输出、多轮会话、本地工具调用与会话持久化；支持 Anthropic Claude 和 OpenAI Chat Completions 原生工具协议。
+Fakuicode 是一个 Python 3.11+ 的终端 Coding Agent。它使用 Textual 提供紧凑的交互界面，支持 SSE 流式输出、多轮工具调用、本地 SQLite 会话、上下文压缩、可复用 Skill、子 Agent、长期 Agent Team、自动记忆、MCP 和生命周期 Hook。
+
+内置 Provider 支持 Anthropic Messages 与 OpenAI Chat Completions 工具协议。Agent Loop 只依赖统一的 `AgentRequest` 接口；旧式 Provider 调用由独立兼容层隔离，不进入主执行路径。
 
 ## 安装与启动
 
@@ -14,6 +16,12 @@ fakuicode
 也可以使用其他配置文件：`fakuicode --config path\to\config.yaml`。
 
 API Key 填写在 `fakuicode.yaml` 的每个 Profile 的 `api_key` 字段。该文件已被 Git 忽略，不应提交。
+
+参与开发时安装完整质量工具：
+
+```powershell
+python -m pip install -e ".[test,quality]"
+```
 
 ## Profile 与模型
 
@@ -40,6 +48,7 @@ Claude 模型使用 adaptive thinking；通过 Anthropic 兼容接口调用 Deep
 - `/help`：显示命令帮助。
 - `/new`：新建本地会话。
 - `/clear`：清空当前内存上下文，不删除已保存的记录。
+- `/compact`：手动执行一次有界上下文整理，不新增用户消息。
 - `/sessions`（别名 `/session`）：列出本地会话。
 - `/resume`：打开本地会话选择器。
 - `/delete`：打开当前工作区的会话删除选择器并在确认后删除；会话用首次普通提问作为标题，旧默认标题会自动回填；仍兼容 `/delete <id>`。
@@ -73,6 +82,14 @@ Skill 把可重复的 SOP 保存为目录型能力包。项目、用户和内置
 
 子 Agent 不会看到 `agent`、任务控制和 Skill 管理工具，因此不能递归委派。它拥有独立消息、权限决策状态、上下文管理和 token 计数，但共享 Provider 传输、文件系统与主 TUI 审批入口。后台启动成功后主 Agent 会结束当前轮并等待自动通知，不会用 `task_get` 空转轮询；任务完成时，TUI 会展示包含 task ID 的可折叠纯文本结果。同一结果在下一轮以不可信数据注入模型上下文，也可通过 `task_get` 读取，不会冒充 system 指令。
 
+### Agent Team
+
+在 Git 仓库的持久会话中，主 Agent 可以创建长期 Team，把带依赖的共享任务分配给多个成员。每个写任务拥有独立 Worktree；成员通过持久邮箱直接通信，空闲后保留会话并可从磁盘恢复。Team 配置、成员、任务、依赖和邮箱统一以 `~/.fakuicode/teams/teams.sqlite3` 为权威状态，关联变更在同一事务中提交；旧 JSON/JSONL 首次读取时会原子导入并保留为只读备份。
+
+Lead 只能通过受约束的集成工具合并已验证提交，冲突会自动中止，最终交付要求一次性确认令牌、干净目标工作树和 `--ff-only`。
+
+当前可运行后端是 `in_process`。`auto` 会明确返回实际选择和原因；显式请求尚未配置的 `subprocess` 后端会失败且不会静默降级。Coordinator 模式需要配置与环境变量双重启用，详细边界和工作流见 [Agent Team 文档](docs/AGENT_TEAMS.md)。
+
 ### 自动记忆与会话连续性
 
 自动记忆默认开启。首次启动会说明：完成的执行轮次可由当前模型在后台提取精炼笔记，笔记只保存在本机 `~/.fakuicode/memory/`，可随时用 `/memory off` 关闭。用户级偏好与当前项目知识分开存放；项目身份按经验证的 Git common-dir 或非 Git 实际路径隔离，不会写入工作区或提交到 Git。
@@ -80,6 +97,12 @@ Skill 把可重复的 SOP 保存为目录型能力包。项目、用户和内置
 每个普通用户轮次开始时只加载一次有界索引，同一工具循环复用该快照。索引是不可信的辅助线索，不能覆盖当前请求、项目指令、权限、计划模式或当前文件证据；详情只能通过当前快照中的精确 UUID 读取。后台维护不拥有普通 Agent 工具，失败时会安全放弃且不影响前台回复或 SQLite 权威会话时间线。
 
 `/resume` 选择器会直接从 SQLite 时间线计算可见消息数，不维护第二份计数。恢复已中断至少 24 小时的会话时，界面会提醒状态可能过时，下一普通请求也会要求模型重新验证关键事实；提醒只使用一次且不写入会话历史。
+
+### 上下文管理
+
+SQLite 时间线始终是事实来源。自动外置、重量摘要、`/compact` 和 `/clear` 只改变发送给模型的活动上下文，不改写或删除用户原始消息，也不会让工具完整结果只剩不可恢复的终端预览。
+
+每次普通模型请求和工具跟随轮次前，系统先把过大的工具结果原子写入 `.fakuicode/context-artifacts/<conversation-id>/`，模型侧保留有界头尾预览、规模、状态和可重读路径，再根据 Provider 的真实 `context_window` 判断是否需要滚动结构化摘要。摘要后会保留近期完整消息/工具组和较新的用户原文，并明确要求细节必须重新读取。摘要连续失败会熔断；Provider 上下文超限最多进行一次有界恢复与原请求重试，不会循环删除历史或无界重试。
 
 ## 本地工具边界
 
@@ -94,9 +117,11 @@ Skill 把可重复的 SOP 保存为目录型能力包。项目、用户和内置
 
 所有内置文件工具限定在启动时的工作目录。路径会先解析既有符号链接和最近存在的祖先，再按路径层级检查是否仍在工作区；执行前还会复核冻结后的目标。`.git`、真实 `fakuicode.yaml`、`.env*`、权限配置、私钥与证书类文件不可被工具访问。
 
-Agent Loop 最多运行 30 轮。连续的安全读取可以并发执行，有副作用的工具按顺序授权和执行；每个已宣布调用都会按原调用 ID 回灌一个结果。权限拒绝是一条普通的失败工具结果，不会直接终止循环，模型可以改用更安全的方案。
+Agent Loop 最多运行 30 轮。连续的安全读取通过应用级共享有界调度器并发执行，有副作用的工具按顺序授权和执行；每个已宣布调用都会按原调用 ID 回灌一个结果。权限拒绝是一条普通的失败工具结果，不会直接终止循环，模型可以改用更安全的方案。
 
-工具活动会显示为紧凑状态行；工具输出被截断，权限确认以内联选择列表显示在对话底部，只展示规范化目标，不显示文件内容、替换文本或搜索词。
+共享只读工具、普通子 Agent 和 Team 进程内成员使用 daemon 工作线程，并保留标准 `Future` 结果语义。应用关闭时先协作取消，未启动任务立即取消，运行中任务只等待有界宽限期；未响应任务会保持 `cancelling` 并报告为 detached，不会被误报为已经终止，也不会继续阻塞解释器退出。Python 线程不能安全强杀，需要硬终止时仍应由未来的独立 `subprocess` 后端提供进程隔离。
+
+工具活动会显示为紧凑状态行。命令输出直接流式写入当前会话工作区的 `.fakuicode/context-artifacts/<conversation-id>/`；大结果只在 SQLite 时间线中保存有界预览和带 SHA-256 的可重读引用，完整证据不进入无界内存。staging 文件和非持久会话目录由跨进程内核锁标记；后续会话启动时只回收锁已释放的孤儿，其他活跃实例和没有安全所有权证据的旧目录会被保留。其他工具结果仍保存于 SQLite，并可在活动上下文超出预算时原子外置。权限确认以内联选择列表显示在对话底部，只展示规范化目标，不显示文件内容、替换文本或搜索词。
 
 ## 权限系统
 
@@ -172,16 +197,28 @@ fakuiCode 可以在应用、会话、轮次、模型消息、工具和上下文�
 
 危险命令熔断器只拦截直接可识别的一小组灾难操作，包括通用 Shell 入口、磁盘格式化/分区工具、块设备直写、关机重启，以及递归强制删除文件系统根目录、用户主目录或整个工作区。它不会把 `git push`、依赖安装、构建、`curl` 或项目内普通删除一概硬拒绝；这些操作由规则和人工确认控制。
 
-路径沙箱只覆盖 Fakuicode 的内置文件工具以及内置 `ls` 兼容路径。`run_command` 使用 `shell=False`、固定工作目录、60 秒超时和输出上限，但它启动的进程及后代没有操作系统级文件或网络隔离。本期也不提供网络域名控制、资源配额、持久化审计日志或完整恶意命令检测；请不要把权限模式理解为容器或系统沙箱。
+路径沙箱只覆盖 Fakuicode 的内置文件工具以及内置 `ls` 兼容路径。`run_command` 使用 `shell=False`、固定工作目录和 60 秒超时；取消或超时时会终止该命令的进程树，但进程及后代仍没有操作系统级文件或网络隔离。本期也不提供网络域名控制、CPU/内存配额、持久化审计日志或完整恶意命令检测；请不要把权限模式理解为容器或系统沙箱。
+
+## 代码结构
+
+- `src/fakuicode/agent.py`：有界 Agent Loop、工具批次调度与停止条件。
+- `src/fakuicode/providers/`：Anthropic/OpenAI 协议实现、统一请求接口与旧 Provider 适配层。
+- `src/fakuicode/session.py`、`src/fakuicode/turns.py`：会话编排与单轮事件/工具证据记录。
+- `src/fakuicode/context_manager.py`、`src/fakuicode/context_artifacts.py`：上下文预算、摘要和完整工具结果外置。
+- `src/fakuicode/tui/app.py`、`src/fakuicode/tui/runtime.py`：Textual 交互层与运行时资源组装；界面不直接承担 Team/Session 构造细节。
+- `src/fakuicode/subagents/`、`src/fakuicode/teams/`：一次性委派、长期 Team、SQLite 状态和 Worktree 集成。
+- `src/fakuicode/skills/`、`src/fakuicode/memory/`、`src/fakuicode/mcp/`、`src/fakuicode/hooks/`：可选能力及其独立信任与生命周期边界。
+- `tests/`：Provider、Agent、上下文、权限、Skill、SubAgent、Team、TUI 和迁移回归测试。
 
 ## 开发验证
 
 ```powershell
+python -m ruff check src tests
+python -m compileall -q src tests
 python -m pytest -q
-python -m compileall -q src
 python -m pip check
 ```
 
-测试只使用本地 Mock Provider/HTTPX MockTransport，不会读取真实配置或访问模型 API。
+GitHub Actions 会在 Python 3.11 的 Ubuntu 与 Windows 环境执行 Ruff、编译检查和完整测试。测试只使用本地 Mock Provider/HTTPX MockTransport，不会读取真实配置或访问模型 API。
 
 协议实现参考：[Anthropic streaming](https://platform.claude.com/docs/en/build-with-claude/streaming)、[Anthropic tool use](https://platform.claude.com/docs/en/build-with-claude/tool-use)、[OpenAI function calling](https://developers.openai.com/api/docs/guides/function-calling)。

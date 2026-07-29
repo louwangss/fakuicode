@@ -14,6 +14,7 @@ from fakuicode.session import AgentSessionController
 from fakuicode.skills.models import SkillDefinition
 from fakuicode.skills.tool import SkillScriptTool
 from fakuicode.storage import ConversationStore
+from fakuicode.tool_scheduler import ReadOnlyToolScheduler
 from fakuicode.subagents.runtime import run_controller_to_completion
 from fakuicode.tools.base import ToolExecution
 from fakuicode.tools.registry import ToolRegistry
@@ -60,6 +61,7 @@ class IsolatedSkillExecutor:
         tool_registry_factory: Callable[[], ToolRegistry],
         custom_instructions: str = "",
         readonly_memory_snapshot: object | Callable[[], object | None] | None = None,
+        read_only_scheduler: ReadOnlyToolScheduler | None = None,
     ) -> None:
         self.store = store
         self.parent_conversation_id = parent_conversation_id
@@ -71,6 +73,7 @@ class IsolatedSkillExecutor:
         self.tool_registry_factory = tool_registry_factory
         self.custom_instructions = custom_instructions
         self.readonly_memory_snapshot = readonly_memory_snapshot
+        self.read_only_scheduler = read_only_scheduler
 
     def run(
         self,
@@ -133,6 +136,7 @@ class IsolatedSkillExecutor:
                     else self.readonly_memory_snapshot
                 ),
                 retry_provider_errors=False,
+                read_only_scheduler=self.read_only_scheduler,
             )
             for message in inherited:
                 self._append_inherited_message(child.id, message)

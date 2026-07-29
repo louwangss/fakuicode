@@ -60,6 +60,34 @@ def test_session_converts_an_unclassified_provider_exception_into_a_safe_error()
     assert session.history == []
 
 
+def test_agent_session_closes_its_provider_once(tmp_path: Path) -> None:
+    from fakuicode.session import AgentSessionController
+    from fakuicode.tools.policy import WorkspacePolicy
+    from fakuicode.tools.registry import ToolRegistry
+
+    class Provider:
+        def __init__(self) -> None:
+            self.cancel_calls = 0
+            self.close_calls = 0
+
+        def cancel(self) -> None:
+            self.cancel_calls += 1
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    provider = Provider()
+    session = AgentSessionController(
+        provider,
+        ToolRegistry(WorkspacePolicy(tmp_path)),
+    )
+
+    session.close()
+    session.close()
+
+    assert provider.close_calls == 1
+
+
 def test_agent_session_owns_one_context_manager_and_anchors_successful_usage(
     tmp_path: Path,
 ) -> None:
@@ -816,6 +844,365 @@ def test_conversation_deletion_removes_database_row_and_context_artifacts(tmp_pa
         store.get_conversation(conversation.id)
 
 
+def test_persistent_session_stores_a_command_preview_and_reference_before_the_next_round(
+    tmp_path: Path,
+) -> None:
+    import sys
+
+    from fakuicode.context import ContextPolicy, approximate_token_count
+    from fakuicode.models import AgentStreamEvent, ToolCall
+    from fakuicode.session import AgentSessionController
+    from fakuicode.storage import ConversationStore
+    from fakuicode.tools.command import RunCommandTool
+    from fakuicode.tools.policy import WorkspacePolicy
+    from fakuicode.tools.registry import ToolRegistry
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stream_agent(self, messages, tools, *, request=None, cancel_event=None):
+            del messages, tools, cancel_event
+            self.calls += 1
+            if self.calls == 1:
+                yield AgentStreamEvent(
+                    "tool_call",
+                    tool_call=ToolCall(
+                        "large-command",
+                        "run_command",
+                        {
+                            "command": [
+                                sys.executable,
+                                "-c",
+                                "print('HEAD-' + 'x' * 50000 + '-TAIL')",
+                            ]
+                        },
+                    ),
+                )
+            else:
+                result = request.messages[-1].tool_results[0]
+                assert "[工具结果已外置]" in result.output
+                yield AgentStreamEvent("text_delta", "complete")
+            yield AgentStreamEvent("completed")
+
+    store = ConversationStore(tmp_path / "history.sqlite3")
+    conversation = store.create_conversation("large", tmp_path, "default")
+    policy = WorkspacePolicy(tmp_path)
+    registry = ToolRegistry(policy, tools=())
+    registry.unregister("run_command")
+    registry.register_system(RunCommandTool(policy))
+    provider = Provider()
+    session = AgentSessionController(
+        provider,
+        registry,
+        store=store,
+        conversation_id=conversation.id,
+    )
+
+    events = list(session.send("run"))
+    persisted = [event for event in store.load_events(conversation.id) if event.kind == "tool_result"]
+
+    assert events[-1].kind == "completed"
+    assert provider.calls == 2
+    assert len(persisted) == 1
+    assert approximate_token_count(persisted[0].content) <= ContextPolicy().tool_preview_max_tokens
+    artifact = persisted[0].metadata["context_artifact"]
+    complete = (tmp_path / artifact["read_path"]).read_text(encoding="utf-8")
+    assert "HEAD-" in complete and "-TAIL" in complete
+    assert artifact["content_sha256"] in artifact["read_path"]
+
+
+def test_tool_result_database_failure_blocks_the_next_provider_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    from fakuicode.models import AgentStreamEvent, ToolCall
+    from fakuicode.session import AgentSessionController
+    from fakuicode.storage import ConversationStore
+    from fakuicode.tools.command import RunCommandTool
+    from fakuicode.tools.policy import WorkspacePolicy
+    from fakuicode.tools.registry import ToolRegistry
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stream_agent(self, messages, tools, *, request=None, cancel_event=None):
+            del messages, tools, request, cancel_event
+            self.calls += 1
+            yield AgentStreamEvent(
+                "tool_call",
+                tool_call=ToolCall(
+                    "large-command",
+                    "run_command",
+                    {"command": [sys.executable, "-c", "print('x' * 50000)"]},
+                ),
+            )
+            yield AgentStreamEvent("completed")
+
+    store = ConversationStore(tmp_path / "history.sqlite3")
+    conversation = store.create_conversation("large", tmp_path, "default")
+    original_append = store.append_event
+
+    def fail_tool_result(conversation_id, kind, content, **kwargs):
+        if kind == "tool_result":
+            raise OSError("injected timeline failure")
+        return original_append(conversation_id, kind, content, **kwargs)
+
+    monkeypatch.setattr(store, "append_event", fail_tool_result)
+    policy = WorkspacePolicy(tmp_path)
+    registry = ToolRegistry(policy, tools=())
+    registry.unregister("run_command")
+    registry.register_system(RunCommandTool(policy))
+    provider = Provider()
+    session = AgentSessionController(
+        provider,
+        registry,
+        store=store,
+        conversation_id=conversation.id,
+    )
+
+    with pytest.raises(OSError, match="injected timeline failure"):
+        list(session.send("run"))
+
+    assert provider.calls == 1
+    artifact_dir = tmp_path / ".fakuicode/context-artifacts" / conversation.id
+    assert len(list(artifact_dir.glob("command-*.txt"))) == 1
+
+
+def test_non_persistent_session_owns_and_cleans_its_command_artifacts(tmp_path: Path) -> None:
+    import sys
+
+    from fakuicode.models import AgentStreamEvent, ToolCall
+    from fakuicode.session import AgentSessionController
+    from fakuicode.tools.command import RunCommandTool
+    from fakuicode.tools.policy import WorkspacePolicy
+    from fakuicode.tools.registry import ToolRegistry
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.read_path = ""
+
+        def stream_agent(self, messages, tools, *, request=None, cancel_event=None):
+            del messages, tools, cancel_event
+            self.calls += 1
+            if self.calls == 1:
+                yield AgentStreamEvent(
+                    "tool_call",
+                    tool_call=ToolCall(
+                        "large-command",
+                        "run_command",
+                        {"command": [sys.executable, "-c", "print('x' * 50000)"]},
+                    ),
+                )
+            else:
+                artifact = request.messages[-1].tool_results[0].metadata["context_artifact"]
+                self.read_path = artifact["read_path"]
+                yield AgentStreamEvent("text_delta", "complete")
+            yield AgentStreamEvent("completed")
+
+    policy = WorkspacePolicy(tmp_path)
+    registry = ToolRegistry(policy, tools=())
+    registry.unregister("run_command")
+    registry.register_system(RunCommandTool(policy))
+    provider = Provider()
+    session = AgentSessionController(provider, registry)
+
+    list(session.send("run"))
+    artifact = tmp_path / provider.read_path
+    artifact_dir = artifact.parent
+    assert artifact.is_file()
+
+    session.close()
+
+    assert not artifact_dir.exists()
+
+
+def test_non_persistent_session_startup_reclaims_only_orphaned_artifacts(tmp_path: Path) -> None:
+    import sys
+
+    from fakuicode.context_artifacts import ContextArtifactStore
+    from fakuicode.models import ToolCall
+    from fakuicode.session import AgentSessionController
+    from fakuicode.tools.command import RunCommandTool
+    from fakuicode.tools.policy import WorkspacePolicy
+    from fakuicode.tools.registry import ToolRegistry
+
+    def build_registry() -> ToolRegistry:
+        policy = WorkspacePolicy(tmp_path)
+        registry = ToolRegistry(policy, tools=())
+        registry.unregister("run_command")
+        registry.register_system(RunCommandTool(policy))
+        return registry
+
+    first_registry = build_registry()
+    first_session = AgentSessionController(object(), first_registry)
+    first_result = first_registry.execute(
+        ToolCall(
+            "active-command",
+            "run_command",
+            {"command": [sys.executable, "-c", "print('active')"]},
+        )
+    )
+    active_artifact = tmp_path / first_result.metadata["context_artifact"]["read_path"]
+    orphaned = ContextArtifactStore(tmp_path, f"ephemeral-{'c' * 32}")
+    orphaned_lease = orphaned.acquire_ephemeral_lease()
+    orphaned.write_tool_result(source_sequence=1, output="orphaned", success=True)
+    orphaned_lease.release()
+
+    second_registry = build_registry()
+    second_session = AgentSessionController(object(), second_registry)
+    try:
+        assert active_artifact.is_file()
+        assert not orphaned.conversation_dir.exists()
+    finally:
+        second_session.close()
+        first_session.close()
+
+
+def test_persistent_session_startup_reclaims_unlocked_staging_files(tmp_path: Path) -> None:
+    from fakuicode.context_artifacts import ContextArtifactStore
+    from fakuicode.session import AgentSessionController
+    from fakuicode.storage import ConversationStore
+    from fakuicode.locking import FileLockPolicy, KernelFileLock
+    from fakuicode.tools.policy import WorkspacePolicy
+    from fakuicode.tools.registry import ToolRegistry
+
+    database = ConversationStore(tmp_path / "history.sqlite3")
+    conversation = database.create_conversation("cleanup", tmp_path, "default")
+    artifacts = ContextArtifactStore(tmp_path, conversation.id)
+    artifacts.conversation_dir.mkdir(parents=True)
+    token = "d" * 32
+    temporary = artifacts.conversation_dir / f".staging-{token}.tmp"
+    lock_path = artifacts.conversation_dir / f".staging-{token}.lock"
+    temporary.write_bytes(b"orphaned")
+    lock = KernelFileLock(lock_path, policy=FileLockPolicy(timeout_seconds=0))
+    lock.acquire()
+    lock.release()
+
+    registry = ToolRegistry(WorkspacePolicy(tmp_path))
+    session = AgentSessionController(
+        object(),
+        registry,
+        store=database,
+        conversation_id=conversation.id,
+    )
+    try:
+        assert not temporary.exists()
+        assert not lock_path.exists()
+    finally:
+        session.close()
+
+
+def test_command_artifact_uses_the_conversation_workspace_not_the_execution_worktree(
+    tmp_path: Path,
+) -> None:
+    import sys
+
+    from fakuicode.models import ToolCall
+    from fakuicode.session import AgentSessionController
+    from fakuicode.storage import ConversationStore
+    from fakuicode.tools.command import RunCommandTool
+    from fakuicode.tools.policy import WorkspacePolicy
+    from fakuicode.tools.registry import ToolRegistry
+
+    project = tmp_path / "project"
+    worktree = tmp_path / "worktree"
+    project.mkdir()
+    worktree.mkdir()
+    store = ConversationStore(tmp_path / "history.sqlite3")
+    conversation = store.create_conversation("child", project, "default")
+    policy = WorkspacePolicy(worktree)
+    registry = ToolRegistry(policy, tools=())
+    registry.unregister("run_command")
+    registry.register_system(RunCommandTool(policy))
+    session = AgentSessionController(
+        object(),
+        registry,
+        store=store,
+        conversation_id=conversation.id,
+    )
+
+    result = registry.execute(
+        ToolCall(
+            "command",
+            "run_command",
+            {"command": [sys.executable, "-c", "print('complete')"]},
+        )
+    )
+
+    read_path = result.metadata["context_artifact"]["read_path"]
+    assert (project / read_path).is_file()
+    assert not (worktree / read_path).exists()
+    session.close()
+
+
+def test_command_artifact_failure_stops_before_the_next_provider_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    from fakuicode.errors import ToolOutputStorageError
+    from fakuicode.models import AgentStreamEvent, ToolCall
+    from fakuicode.session import AgentSessionController
+    from fakuicode.storage import ConversationStore
+    from fakuicode.tools.command import RunCommandTool
+    from fakuicode.tools.policy import WorkspacePolicy
+    from fakuicode.tools.registry import ToolRegistry
+
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def stream_agent(self, messages, tools, *, request=None, cancel_event=None):
+            del messages, tools, request, cancel_event
+            self.calls += 1
+            if self.calls > 1:
+                raise AssertionError("provider must not continue after artifact failure")
+            yield AgentStreamEvent(
+                "tool_call",
+                tool_call=ToolCall(
+                    "command",
+                    "run_command",
+                    {"command": [sys.executable, "-c", "print('complete')"]},
+                ),
+            )
+            yield AgentStreamEvent("completed")
+
+    store = ConversationStore(tmp_path / "history.sqlite3")
+    conversation = store.create_conversation("failure", tmp_path, "default")
+    policy = WorkspacePolicy(tmp_path)
+    registry = ToolRegistry(policy, tools=())
+    registry.unregister("run_command")
+    registry.register_system(RunCommandTool(policy))
+    provider = Provider()
+    session = AgentSessionController(
+        provider,
+        registry,
+        store=store,
+        conversation_id=conversation.id,
+    )
+
+    def fail_capture(**kwargs):
+        del kwargs
+        raise OSError("disk full")
+
+    monkeypatch.setattr(
+        session.context_manager.artifact_store,
+        "write_command_result_streams",
+        fail_capture,
+    )
+
+    with pytest.raises(ToolOutputStorageError):
+        list(session.send("run"))
+
+    assert provider.calls == 1
+
+
 def test_parent_deletion_removes_hidden_skill_children_and_their_artifacts(tmp_path: Path) -> None:
     from fakuicode.context_artifacts import ContextArtifactStore
     from fakuicode.session import delete_conversation_with_artifacts
@@ -845,6 +1232,53 @@ def test_parent_deletion_removes_hidden_skill_children_and_their_artifacts(tmp_p
     assert not (tmp_path / child_reference.read_path).exists()
     with pytest.raises(KeyError):
         store.get_conversation(child.id)
+
+
+def test_parent_deletion_removes_recursive_children_from_their_own_workspaces(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.context_artifacts import ContextArtifactStore
+    from fakuicode.session import delete_conversation_with_artifacts
+    from fakuicode.storage import ConversationStore
+
+    main_workspace = tmp_path / "main"
+    child_workspace = tmp_path / "child-worktree"
+    main_workspace.mkdir()
+    child_workspace.mkdir()
+    store = ConversationStore(tmp_path / "history.sqlite3")
+    parent = store.create_conversation("parent", main_workspace, "default")
+    child = store.create_conversation(
+        "Agent: worker",
+        child_workspace,
+        "default",
+        conversation_type="agent",
+        parent_conversation_id=parent.id,
+        agent_name="worker",
+    )
+    grandchild = store.create_conversation(
+        "Skill: inspect",
+        main_workspace,
+        "default",
+        conversation_type="skill",
+        parent_conversation_id=child.id,
+        skill_name="inspect",
+    )
+    child_reference = ContextArtifactStore(
+        child_workspace, child.id
+    ).write_tool_result(source_sequence=1, output="child", success=True)
+    grandchild_reference = ContextArtifactStore(
+        main_workspace, grandchild.id
+    ).write_tool_result(source_sequence=1, output="grandchild", success=True)
+
+    result = delete_conversation_with_artifacts(store, parent.id)
+
+    assert result.artifacts_cleaned is True
+    assert not (child_workspace / child_reference.read_path).exists()
+    assert not (main_workspace / grandchild_reference.read_path).exists()
+    with pytest.raises(KeyError):
+        store.get_conversation(child.id)
+    with pytest.raises(KeyError):
+        store.get_conversation(grandchild.id)
 
 
 def test_conversation_deletion_restores_artifacts_when_database_delete_fails(

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
-from datetime import timedelta
 from typing import Any
 
 import httpx
@@ -110,6 +109,7 @@ class McpSdkConnectionFactory:
                     command=config.command,
                     args=list(config.args),
                     env={key: secret.value for key, secret in config.environment.items()},
+                    cwd=config.working_directory,
                 )
                 read_stream, write_stream = await stack.enter_async_context(stdio_client(parameters))
             else:

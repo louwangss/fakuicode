@@ -33,6 +33,7 @@ class ToolPreparation:
     arguments: Mapping[str, object]
     target: str
     permission_scope: PermissionScope = PermissionScope.TARGET
+    permission_capability: str | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class PreparedToolCall:
     target: str
     read_only: bool
     permission_scope: PermissionScope = PermissionScope.TARGET
+    permission_capability: str | None = None
 
 
 class Tool(Protocol):

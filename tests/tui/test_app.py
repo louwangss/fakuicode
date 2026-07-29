@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Iterator, Sequence
 from io import StringIO
 from pathlib import Path
+import subprocess
 from threading import Event
 from time import sleep
 
@@ -314,6 +315,159 @@ def make_config() -> object:
     from fakuicode.models import ProviderConfig
 
     return ProviderConfig("anthropic", "claude-test", "https://api.example.test/v1", "test-key")
+
+
+def make_git_repository(root: Path) -> Path:
+    repo = root / "repo"
+    repo.mkdir()
+    for args in (
+        ("init",),
+        ("config", "user.name", "Team Test"),
+        ("config", "user.email", "team@example.test"),
+    ):
+        subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "base"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return repo
+
+
+def test_app_assembles_sessions_through_an_explicit_runtime_bundle(tmp_path: Path) -> None:
+    from fakuicode.session import AgentSessionController, SessionController
+    from fakuicode.tui.app import FakuicodeApp
+    from fakuicode.tui.runtime import RuntimeBundle, TeamFeatureRuntime
+
+    agent_app = FakuicodeApp(
+        make_config(),
+        provider=AgentTextProvider(),
+        workspace=tmp_path,
+    )
+
+    assert isinstance(agent_app._runtime_bundle, RuntimeBundle)
+    assert isinstance(agent_app._team_feature, TeamFeatureRuntime)
+    assert isinstance(agent_app.session, AgentSessionController)
+    assert agent_app._runtime_bundle.session is agent_app.session
+    assert agent_app._runtime_bundle.task_manager is agent_app._task_manager
+    agent_app._close_agent_session()
+
+    chat_app = FakuicodeApp(
+        make_config(),
+        provider=FakeProvider([]),
+        workspace=tmp_path,
+    )
+
+    assert isinstance(chat_app._runtime_bundle, RuntimeBundle)
+    assert isinstance(chat_app.session, SessionController)
+    assert chat_app._runtime_bundle.task_manager is None
+
+
+def test_team_create_tool_is_wired_only_with_explicit_persistence_root(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.storage import ConversationStore
+    from fakuicode.tui.app import FakuicodeApp
+
+    repo = make_git_repository(tmp_path)
+    app = FakuicodeApp(
+        make_config(),
+        provider=AgentTextProvider(),
+        store=ConversationStore(tmp_path / "history.sqlite3"),
+        workspace=repo,
+        team_home=tmp_path / "teams",
+    )
+
+    assert app.session.runner.tools.is_known("team_create")
+    assert app._team_service is not None
+
+
+def test_team_activation_grants_only_the_current_workflow_capability(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.storage import ConversationStore
+    from fakuicode.tui.app import FakuicodeApp
+    from fakuicode.models import ToolCall
+
+    repo = make_git_repository(tmp_path)
+    app = FakuicodeApp(
+        make_config(),
+        provider=AgentTextProvider(),
+        store=ConversationStore(tmp_path / "history.sqlite3"),
+        workspace=repo,
+        team_home=tmp_path / "teams",
+    )
+    registry = app.session.runner.tools
+
+    created = registry._tools["team_create"].execute({"name": "alpha"})
+    actor = app._team_service.actor()
+
+    assert created.success is True
+    assert registry.permission_manager.session_capabilities == (
+        actor.workflow_capability,
+    )
+    cancelled = Event()
+    cancelled.set()
+    task_result = registry.execute(
+        ToolCall(
+            "task-create",
+            "team_task_create",
+            {"title": "读取文档", "description": "", "kind": "read_only"},
+        ),
+        cancel_event=cancelled,
+    )
+    finalize_result = registry.execute(
+        ToolCall(
+            "finalize",
+            "team_finalize",
+            {"confirmation_token": "untrusted-model-token"},
+        ),
+        cancel_event=cancelled,
+    )
+
+    assert task_result.success is True
+    assert finalize_result.success is False
+    assert finalize_result.summary == "permission denied"
+
+
+def test_coordinator_dual_gate_applies_ceiling_and_instructions(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.storage import ConversationStore
+    from fakuicode.teams.config import TeamFeatureConfig
+    from fakuicode.tui.app import FakuicodeApp
+
+    repo = make_git_repository(tmp_path)
+    app = FakuicodeApp(
+        make_config(),
+        provider=AgentTextProvider(),
+        store=ConversationStore(tmp_path / "history.sqlite3"),
+        workspace=repo,
+        team_home=tmp_path / "teams",
+        team_config=TeamFeatureConfig(coordinator_enabled=True),
+        team_environment={"FAKUICODE_COORDINATOR": "1"},
+    )
+    registry = app.session.runner.tools
+
+    result = registry._tools["team_create"].execute({"name": "alpha"})
+
+    assert result.success is True
+    names = {definition.name for definition in registry.definitions()}
+    assert "team_member_start" in names
+    assert "write_file" not in names
+    assert "run_command" not in names
+    assert "agent" not in names
+    assert "Team Coordinator 模式" in app.session.runner.custom_instructions
 
 
 def test_app_lifecycle_hook_payload_contract(
@@ -628,12 +782,12 @@ def test_resume_gap_shows_and_injects_one_nonpersistent_time_span_reminder(
         store.append_event(previous.id, "assistant", "old answer")
         original_list = store.list_conversations
 
-        def old_conversations() -> list[object]:
+        def old_conversations(*, workspace: Path | None = None) -> list[object]:
             return [
                 replace(item, updated_at=now - 2 * 24 * 60 * 60 * 1_000_000_000)
                 if item.id == previous.id
                 else item
-                for item in original_list()
+                for item in original_list(workspace=workspace)
             ]
 
         monkeypatch.setattr(store, "list_conversations", old_conversations)
@@ -1506,7 +1660,6 @@ def test_app_persists_an_agent_turn_without_cross_thread_sqlite_errors(tmp_path:
 
 def test_app_starts_a_new_conversation_and_resume_restores_the_selected_history(tmp_path: Path) -> None:
     from fakuicode.storage import ConversationStore
-    from fakuicode.tui.app import FakuicodeApp
 
     store = ConversationStore(tmp_path / "history.sqlite3")
     record = store.create_conversation("Previous", tmp_path, "default")
@@ -1878,6 +2031,58 @@ def test_instruction_snapshot_reloads_only_at_approved_session_boundaries(tmp_pa
     asyncio.run(run())
 
 
+def test_profile_switch_and_app_shutdown_close_each_owned_provider_once(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        from fakuicode.models import ProfileSet, ProviderConfig
+        from fakuicode.tui.app import FakuicodeApp
+
+        class Provider(AgentTextProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.close_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        default = make_config()
+        alternate = ProviderConfig(
+            "openai",
+            "alternate",
+            "https://api.example.test/v1",
+            "test-key",
+        )
+        profiles = ProfileSet(
+            {"default": default, "alternate": alternate},
+            "default",
+        )
+        first = Provider()
+        created: list[Provider] = []
+
+        def factory(_config: ProviderConfig) -> Provider:
+            provider = Provider()
+            created.append(provider)
+            return provider
+
+        app = FakuicodeApp(
+            default,
+            provider=first,
+            provider_factory=factory,
+            profiles=profiles,
+            workspace=tmp_path,
+        )
+
+        async with app.run_test():
+            app._switch_profile("alternate")
+            assert first.close_calls == 1
+            assert len(created) == 1
+
+        assert created[0].close_calls == 1
+
+    asyncio.run(run())
+
+
 def test_status_reports_instruction_snapshot_metadata_without_content(tmp_path: Path) -> None:
     async def run() -> None:
         from fakuicode.instructions import (
@@ -2121,6 +2326,93 @@ def test_tui_delete_command_coordinates_database_and_context_artifacts(tmp_path:
             assert deleted_id not in {record.id for record in store.list_conversations()}
             assert not (tmp_path / reference.read_path).exists()
             assert provider.calls == []
+
+    asyncio.run(run())
+
+
+def test_tui_stops_the_current_session_before_deleting_its_timeline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        import fakuicode.tui.app as app_module
+        from fakuicode.storage import ConversationStore
+        from fakuicode.tui.app import FakuicodeApp
+
+        store = ConversationStore(tmp_path / "history.sqlite3")
+        app = FakuicodeApp(
+            make_config(),
+            provider=AgentTextProvider(),
+            store=store,
+            workspace=tmp_path,
+        )
+        operations: list[str] = []
+        original_close = app._close_agent_session
+        original_delete = app_module.delete_conversation_with_artifacts
+
+        def track_close() -> None:
+            operations.append("close")
+            original_close()
+
+        def track_delete(target_store, conversation_id):
+            operations.append("delete")
+            return original_delete(target_store, conversation_id)
+
+        monkeypatch.setattr(app, "_close_agent_session", track_close)
+        monkeypatch.setattr(
+            app_module,
+            "delete_conversation_with_artifacts",
+            track_delete,
+        )
+
+        async with app.run_test():
+            assert app.conversation is not None
+            app._delete_conversation(app.conversation.id)
+            assert operations[:2] == ["close", "delete"]
+
+    asyncio.run(run())
+
+
+def test_tui_session_commands_do_not_expose_or_delete_another_workspace(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        from fakuicode.storage import ConversationStore
+        from fakuicode.tui.app import FakuicodeApp
+        from fakuicode.tui.widgets import SystemNotice
+
+        workspace = tmp_path / "current"
+        other_workspace = tmp_path / "other"
+        workspace.mkdir()
+        other_workspace.mkdir()
+        store = ConversationStore(tmp_path / "history.sqlite3")
+        local = store.create_conversation("Local session", workspace, "default")
+        foreign = store.create_conversation(
+            "Foreign secret session",
+            other_workspace,
+            "default",
+        )
+        app = FakuicodeApp(
+            make_config(),
+            provider=AgentTextProvider(),
+            store=store,
+            workspace=workspace,
+        )
+
+        async with app.run_test():
+            app.show_sessions()
+            rendered = app.query(SystemNotice).last().render().plain
+            assert local.id[:8] in rendered
+            assert foreign.id[:8] not in rendered
+            assert foreign.title not in rendered
+
+            app._delete_conversation(foreign.id)
+            assert store.get_conversation(foreign.id) == foreign
+            assert "not found or is ambiguous" in app.query(SystemNotice).last().render().plain
+
+            app._delete_conversation(foreign.id[:8])
+            assert store.get_conversation(foreign.id) == foreign
+            assert "not found or is ambiguous" in app.query(SystemNotice).last().render().plain
 
     asyncio.run(run())
 
@@ -3130,7 +3422,14 @@ def test_project_mcp_trust_prompt_defaults_to_reject_without_connecting(tmp_path
         from fakuicode.tui.widgets import ConversationView, PromptEditor
 
         snapshot = McpConfigSnapshot(
-            servers=(StdioServerConfig("project", McpConfigSource.PROJECT, "python"),),
+            servers=(
+                StdioServerConfig(
+                    "project",
+                    McpConfigSource.PROJECT,
+                    "python executable",
+                    ("server.py", "value with spaces"),
+                ),
+            ),
             has_configuration=True,
         )
         app = FakuicodeApp(
@@ -3144,6 +3443,11 @@ def test_project_mcp_trust_prompt_defaults_to_reject_without_connecting(tmp_path
         async with app.run_test() as pilot:
             prompt = app.query_one(McpTrustPrompt)
             options = prompt.query_one(OptionList)
+            rendered = "\n".join(item.render().plain for item in prompt.query(Static))
+            assert 'command: "python executable"' in rendered
+            assert 'argv[0] = "server.py"' in rendered
+            assert 'argv[1] = "value with spaces"' in rendered
+            assert f"工作目录：{tmp_path.resolve()}" in rendered
             assert options.highlighted == 1
             app.query_one(ConversationView).focus()
             await pilot.pause()
@@ -3272,3 +3576,30 @@ def test_builtin_test_skill_runs_in_hidden_child_and_returns_summary(tmp_path: P
             assert children[0] in app.session.history[-1].content
 
     asyncio.run(run())
+
+
+def test_worktree_sweeper_shutdown_is_bounded_when_sweep_is_unresponsive(
+    monkeypatch,
+) -> None:
+    from threading import Event, Thread
+    from time import monotonic
+
+    import fakuicode.tui.app as app_module
+    from fakuicode.tui.app import FakuicodeApp
+
+    release = Event()
+    worker = Thread(target=release.wait, daemon=True)
+    worker.start()
+    app = object.__new__(FakuicodeApp)
+    object.__setattr__(app, "_worktree_sweep_stop", Event())
+    object.__setattr__(app, "_worktree_sweep_thread", worker)
+    monkeypatch.setattr(app_module, "DEFAULT_COOPERATIVE_SHUTDOWN_GRACE_SECONDS", 0.02)
+
+    started = monotonic()
+    try:
+        app._stop_worktree_sweeper()
+        assert monotonic() - started < 0.5
+        assert app._worktree_sweep_stop.is_set()
+        assert app._worktree_sweep_thread is None
+    finally:
+        release.set()

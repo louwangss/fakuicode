@@ -16,7 +16,6 @@ import yaml
 from fakuicode.mcp.config import referenced_variables
 from fakuicode.mcp.models import (
     DisabledServerConfig,
-    HttpServerConfig,
     McpConfigSource,
     McpDiagnostic,
     McpFailureCode,
@@ -86,8 +85,9 @@ def build_trust_request(workspace: Path, config: McpServerConfig) -> McpTrustReq
         return McpTrustRequest(
             identity=identity,
             transport=McpTransportType.STDIO,
-            command=_ellipsize(config.command),
-            argument_count=len(config.args),
+            command=config.command,
+            arguments=config.args,
+            working_directory=workspace.resolve(),
             environment_names=tuple(sorted(config.env_templates)),
             referenced_variable_names=referenced_variables(config),
         )

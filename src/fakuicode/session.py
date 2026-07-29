@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 from threading import Event, RLock
+from uuid import uuid4
 
 from fakuicode.agent import AgentRunner, ToolExecutor
 from fakuicode.context_artifacts import ContextArtifactStore
@@ -23,7 +24,6 @@ from fakuicode.hooks.runtime import HookEngine
 from fakuicode.memory.models import (
     AgentTurnContext,
     CompletedTurn,
-    SafeToolSummary,
 )
 from fakuicode.models import (
     AgentMessage,
@@ -31,13 +31,17 @@ from fakuicode.models import (
     AgentStreamEvent,
     ContextStatus,
     Message,
-    ProviderMessageState,
+    ProviderConfig,
     StreamEvent,
     TokenUsage,
 )
 from fakuicode.providers.base import AgentProvider, AgentRequest, ChatProvider
+from fakuicode.skills.models import ActiveSkill, SkillExecution, SkillSource
 from fakuicode.storage import ConversationStore
+from fakuicode.locking import KernelFileLock
+from fakuicode.tool_scheduler import ReadOnlyToolScheduler
 from fakuicode.tools.base import ToolExecution
+from fakuicode.turns import TurnRecorder
 
 
 @dataclass(frozen=True)
@@ -54,12 +58,11 @@ def delete_conversation_with_artifacts(
 ) -> ConversationDeletionResult:
     """Delete one conversation without orphaning or prematurely losing its artifacts."""
 
-    record = store.get_conversation(conversation_id)
-    conversation_ids = (conversation_id, *store.child_conversation_ids(conversation_id))
+    records = store.conversation_subtree(conversation_id)
     staged: list[tuple[ContextArtifactStore, Path]] = []
     try:
-        for target_id in conversation_ids:
-            artifacts = ContextArtifactStore(record.workspace, target_id)
+        for record in records:
+            artifacts = ContextArtifactStore(record.workspace, record.id)
             tombstone = artifacts.stage_conversation_deletion()
             if tombstone is not None:
                 staged.append((artifacts, tombstone))
@@ -90,6 +93,7 @@ class SessionController:
     def __init__(self, provider: ChatProvider) -> None:
         self.provider = provider
         self.history: list[Message] = []
+        self._closed = False
 
     def send(self, text: str, *, cancel_event: Event | None = None) -> Iterator[StreamEvent]:
         current = Message("user", text)
@@ -114,6 +118,17 @@ class SessionController:
             raise ProviderError("Provider completed without text content.")
         self.history.extend((current, Message("assistant", final_answer)))
 
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        cancel = getattr(self.provider, "cancel", None)
+        if callable(cancel):
+            cancel()
+        close = getattr(self.provider, "close", None)
+        if callable(close):
+            close()
+
 
 class AgentSessionController:
     """Persisted agent state, including plan mode and cumulative exact token usage."""
@@ -134,7 +149,9 @@ class AgentSessionController:
         max_iterations: int = 30,
         request_template: AgentRequest | None = None,
         preserve_request_history: bool = False,
+        read_only_scheduler: ReadOnlyToolScheduler | None = None,
     ) -> None:
+        self.provider = provider
         self.store = store
         self.conversation_id = conversation_id
         self.memory_service = memory_service
@@ -148,6 +165,9 @@ class AgentSessionController:
         candidate_hooks = getattr(tools, "hook_engine", None)
         self.hook_engine = candidate_hooks if isinstance(candidate_hooks, HookEngine) else None
         self._hook_session_closed = False
+        self._closed = False
+        self._owns_read_only_scheduler = read_only_scheduler is None
+        self.read_only_scheduler = read_only_scheduler or ReadOnlyToolScheduler()
         workspace = tool_workspace if isinstance(tool_workspace, Path) else Path.cwd()
         if store is not None and conversation_id is not None:
             workspace = store.get_conversation(conversation_id).workspace
@@ -161,6 +181,24 @@ class AgentSessionController:
             conversation_id=None if preserve_request_history else conversation_id,
             lifecycle_callback=self._context_lifecycle_hook,
         )
+        self._ephemeral_artifact_store: ContextArtifactStore | None = None
+        self._ephemeral_artifact_lease: KernelFileLock | None = None
+        bind_artifacts = getattr(tools, "set_context_artifact_store", None)
+        if callable(bind_artifacts):
+            artifact_store = self.context_manager.artifact_store
+            if artifact_store is None:
+                artifact_store = ContextArtifactStore(
+                    workspace,
+                    f"ephemeral-{uuid4().hex}",
+                )
+                self._ephemeral_artifact_store = artifact_store
+                try:
+                    artifact_store.cleanup_orphaned_ephemeral_artifacts()
+                    artifact_store.cleanup_orphaned_staging_files()
+                except (OSError, ValueError):
+                    self.context_manager.artifact_cleanup_failed = True
+                self._ephemeral_artifact_lease = artifact_store.acquire_ephemeral_lease()
+            bind_artifacts(artifact_store)
         self.runner = AgentRunner(
             provider,
             tools,
@@ -170,6 +208,7 @@ class AgentSessionController:
             retry_provider_errors=retry_provider_errors,
             max_iterations=max_iterations,
             request_template=request_template,
+            read_only_scheduler=self.read_only_scheduler,
         )
         if skill_manager is not None:
             try:
@@ -265,8 +304,6 @@ class AgentSessionController:
                 message = outcome.output
                 yield from self._finish_direct_skill_failure(current, message)
                 return
-            from fakuicode.skills import SkillExecution
-
             if definition.execution is SkillExecution.ISOLATED:
                 yield from self._finish_direct_isolated_skill(current, outcome)
                 return
@@ -298,41 +335,11 @@ class AgentSessionController:
                 turn_context = AgentTurnContext(
                     first_request_reminder=turn_context.first_request_reminder
                 )
-        turn_history: list[AgentMessage] = [current]
-        response_text: list[str] = []
-        calls: list = []
-        provider_states: list[ProviderMessageState] = []
-        pending_results: list = []
-        tool_turn_persisted = False
-        round_usage: TokenUsage | None = None
-        completed = False
-        terminated_without_completion = False
-        safe_tool_summaries: list[SafeToolSummary] = []
-
-        def flush_results() -> None:
-            nonlocal pending_results
-            if pending_results:
-                turn_history.append(AgentMessage("user", tool_results=tuple(pending_results)))
-                pending_results = []
-
-        def flush_usage() -> None:
-            nonlocal round_usage
-            if round_usage is None:
-                self._usage_unavailable = True
-                return
-            if round_usage.input_tokens is None or round_usage.output_tokens is None:
-                self._usage_unavailable = True
-            else:
-                self._input_tokens += round_usage.input_tokens
-                self._output_tokens += round_usage.output_tokens
-                self._saw_usage = True
-            if round_usage.cache_read_tokens is None and round_usage.cache_write_tokens is None:
-                self._cache_usage_unavailable = True
-            else:
-                self._cache_read_tokens += round_usage.cache_read_tokens or 0
-                self._cache_write_tokens += round_usage.cache_write_tokens or 0
-                self._saw_cache_usage = True
-            round_usage = None
+        recorder = TurnRecorder(
+            current,
+            append_event=self._append_event,
+            usage_sink=self._record_round_usage,
+        )
 
         for event in self.runner.run(
             [*self.history, current],
@@ -340,86 +347,11 @@ class AgentSessionController:
             mode=self.mode,
             turn_context=turn_context,
         ):
-            if event.provider_state is not None:
-                provider_states.append(event.provider_state)
-            if event.kind == "progress" and event.progress is not None:
-                if event.progress.phase == "model":
-                    flush_results()
-                    response_text = []
-                    calls = []
-                    provider_states = []
-                    tool_turn_persisted = False
-                else:
-                    flush_usage()
-            elif event.kind == "usage" and event.usage is not None:
-                round_usage = event.usage
-            elif event.kind == "text_delta":
-                response_text.append(event.text)
-            elif event.kind == "tool_call" and event.tool_call is not None:
-                calls.append(event.tool_call)
-            elif event.kind == "tool_result" and event.tool_result is not None:
-                if not tool_turn_persisted:
-                    provider_state = _merge_provider_states(provider_states)
-                    assistant = AgentMessage(
-                        "assistant",
-                        "".join(response_text),
-                        tuple(calls),
-                        provider_state=provider_state,
-                    )
-                    turn_history.append(assistant)
-                    assistant_metadata: dict[str, object] = {
-                        "tool_calls": _tool_call_metadata(calls)
-                    }
-                    if provider_state is not None:
-                        assistant_metadata["provider_state"] = _provider_state_metadata(
-                            provider_state
-                        )
-                    self._append_event(
-                        "assistant",
-                        assistant.content,
-                        metadata=assistant_metadata,
-                    )
-                    for call in calls:
-                        self._append_event(
-                            "tool_call", call.name, call_id=call.id, metadata={"arguments": dict(call.arguments)}
-                        )
-                    tool_turn_persisted = True
-                pending_results.append(event.tool_result)
-                safe_tool_summaries.append(
-                    SafeToolSummary(
-                        event.tool_result.tool_name,
-                        event.tool_result.success,
-                        event.tool_result.summary,
-                    )
-                )
-                self._append_event(
-                    "tool_result",
-                    event.tool_result.output,
-                    call_id=event.tool_result.call_id,
-                    metadata={
-                        "tool_name": event.tool_result.tool_name,
-                        "success": event.tool_result.success,
-                        "summary": event.tool_result.summary,
-                        **(
-                            {"duration_seconds": event.tool_result.duration_seconds}
-                            if event.tool_result.duration_seconds is not None
-                            else {}
-                        ),
-                        **(dict(event.tool_result.metadata) if event.tool_result.metadata is not None else {}),
-                    },
-                )
-            elif event.kind == "completed":
-                flush_usage()
-                flush_results()
-                answer = "".join(response_text)
-                if not answer.strip():
-                    raise ProviderError("Provider completed without text content.")
-                turn_history.append(AgentMessage("assistant", answer))
-                assistant_event = self._append_event("assistant", answer)
-                self.history.extend(turn_history)
+            outcome = recorder.consume(event)
+            if outcome == "completed":
+                self.history.extend(recorder.history)
                 if self.mode == "plan":
-                    self.saved_plan = answer
-                completed = True
+                    self.saved_plan = recorder.answer
                 if (
                     turn_mode == "execute"
                     and self.memory_service is not None
@@ -427,19 +359,17 @@ class AgentSessionController:
                     and turn_context.settings_generation is not None
                     and self.conversation_id is not None
                     and user_event is not None
-                    and assistant_event is not None
+                    and recorder.assistant_event is not None
                 ):
                     config = getattr(self.runner.provider, "config", None)
-                    from fakuicode.models import ProviderConfig
-
                     if isinstance(config, ProviderConfig):
                         completed_turn = CompletedTurn(
                             self.conversation_id,
                             user_event.sequence,
-                            assistant_event.sequence,
+                            recorder.assistant_event.sequence,
                             text,
-                            answer,
-                            tuple(safe_tool_summaries),
+                            recorder.answer,
+                            recorder.safe_tool_summaries,
                             config,
                             turn_context.memory_snapshot.project_id,
                             turn_context.settings_generation,
@@ -448,19 +378,30 @@ class AgentSessionController:
                             completed_turn,
                             turn_context.memory_snapshot,
                         )
-            elif event.kind in {"cancelled", "error"}:
-                terminated_without_completion = True
-                flush_usage()
-                flush_results()
-                self.history.extend(turn_history)
-                self._append_event("system", event.text or event.kind)
+            elif outcome == "terminated":
+                self.history.extend(recorder.history)
                 if self.mode == "plan":
                     self.mode = "execute"
                     self.saved_plan = None
             yield event
-        if not completed and not terminated_without_completion:
-            # AgentRunner always emits a terminal event. This guard protects non-conforming replacements.
-            raise ProviderError("Agent stream ended before completion.")
+        recorder.ensure_terminal()
+
+    def _record_round_usage(self, round_usage: TokenUsage | None) -> None:
+        if round_usage is None:
+            self._usage_unavailable = True
+            return
+        if round_usage.input_tokens is None or round_usage.output_tokens is None:
+            self._usage_unavailable = True
+        else:
+            self._input_tokens += round_usage.input_tokens
+            self._output_tokens += round_usage.output_tokens
+            self._saw_usage = True
+        if round_usage.cache_read_tokens is None and round_usage.cache_write_tokens is None:
+            self._cache_usage_unavailable = True
+        else:
+            self._cache_read_tokens += round_usage.cache_read_tokens or 0
+            self._cache_write_tokens += round_usage.cache_write_tokens or 0
+            self._saw_cache_usage = True
 
     def cancel(self) -> None:
         self.runner.cancel()
@@ -559,24 +500,53 @@ class AgentSessionController:
         return result.status
 
     def close(self) -> None:
-        if not self._hook_session_closed:
-            self._hook_session_closed = True
-            self._dispatch_hook(
-                HookEvent.SESSION_END,
-                {
-                    "session": {
-                        "conversation_id": self.conversation_id,
-                        "outcome": "completed",
-                    }
-                },
-            )
+        if self._closed:
+            return
+        self._closed = True
+        self._hook_session_closed = True
+        self._dispatch_hook(
+            HookEvent.SESSION_END,
+            {
+                "session": {
+                    "conversation_id": self.conversation_id,
+                    "outcome": "completed",
+                }
+            },
+        )
         self.runner.cancel()
-        close_skills = getattr(self.skill_manager, "close", None)
-        if callable(close_skills):
-            close_skills()
-        close_tools = getattr(self.runner.tools, "close", None)
-        if callable(close_tools):
-            close_tools()
+        try:
+            close_skills = getattr(self.skill_manager, "close", None)
+            if callable(close_skills):
+                close_skills()
+            close_tools = getattr(self.runner.tools, "close", None)
+            if callable(close_tools):
+                close_tools()
+        finally:
+            try:
+                self._cleanup_ephemeral_artifacts()
+            finally:
+                try:
+                    close_provider = getattr(self.provider, "close", None)
+                    if callable(close_provider):
+                        close_provider()
+                finally:
+                    if self._owns_read_only_scheduler:
+                        self.read_only_scheduler.close()
+
+    def _cleanup_ephemeral_artifacts(self) -> None:
+        artifacts = self._ephemeral_artifact_store
+        if artifacts is None:
+            return
+        lease = self._ephemeral_artifact_lease
+        self._ephemeral_artifact_lease = None
+        if lease is not None:
+            lease.release()
+        try:
+            tombstone = artifacts.stage_conversation_deletion()
+            if tombstone is not None:
+                artifacts.purge_staged_deletion(tombstone)
+        except (OSError, ValueError):
+            self.context_manager.artifact_cleanup_failed = True
 
     def clear_context(self) -> None:
         """Forget prior model context while retaining the immutable local timeline."""
@@ -718,8 +688,6 @@ class AgentSessionController:
     def _load_active_skills(self):
         if self.store is None or self.conversation_id is None:
             return ()
-        from fakuicode.skills import ActiveSkill, SkillSource
-
         restored = []
         for event in self.store.load_active_skill_events(self.conversation_id):
             metadata = event.metadata
@@ -746,32 +714,3 @@ class AgentSessionController:
 def _raise_if_cancelled(cancel_event: Event | None) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise RequestCancelled()
-
-
-def _tool_call_metadata(calls: list[object]) -> list[dict[str, object]]:
-    return [
-        {"id": call.id, "name": call.name, "arguments": dict(call.arguments)}
-        for call in calls
-        if hasattr(call, "id") and hasattr(call, "name") and hasattr(call, "arguments")
-    ]
-
-
-def _merge_provider_states(
-    states: list[ProviderMessageState],
-) -> ProviderMessageState | None:
-    if not states:
-        return None
-    protocol = states[0].protocol
-    if any(state.protocol != protocol for state in states):
-        raise ProviderError("Provider emitted incompatible message state.")
-    return ProviderMessageState(
-        protocol,
-        tuple(block for state in states for block in state.thinking_blocks),
-    )
-
-
-def _provider_state_metadata(state: ProviderMessageState) -> dict[str, object]:
-    return {
-        "protocol": state.protocol,
-        "thinking_blocks": [dict(block) for block in state.thinking_blocks],
-    }

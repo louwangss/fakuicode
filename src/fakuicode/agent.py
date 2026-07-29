@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
 from threading import Event
 from typing import Protocol
@@ -19,10 +19,12 @@ from fakuicode.errors import (
     PROVIDER_FAILURE_PHASE_VALUES,
     ProviderError,
     RequestCancelled,
+    ToolOutputStorageError,
     normalize_provider_request_id,
 )
 from fakuicode.hooks.models import HookEvent
 from fakuicode.hooks.runtime import HookEngine
+from fakuicode.lifecycle import DaemonFutureExecutor
 from fakuicode.memory.models import AgentTurnContext
 from fakuicode.models import (
     AgentMessage,
@@ -35,9 +37,13 @@ from fakuicode.models import (
     ToolResult,
     TokenUsage,
 )
+from fakuicode.tool_scheduler import ReadOnlyToolScheduler
 from fakuicode.prompting import build_request_envelope
 from fakuicode.providers.base import AgentProvider, AgentRequest
-from fakuicode.providers.invocation import invoke_provider_stream
+from fakuicode.providers.invocation import (
+    invoke_provider_stream,
+    provider_supports_structured_requests,
+)
 
 
 MAX_ITERATIONS = 30
@@ -140,6 +146,7 @@ class AgentRunner:
         skill_manager: object | None = None,
         retry_provider_errors: bool = True,
         request_template: AgentRequest | None = None,
+        read_only_scheduler: ReadOnlyToolScheduler | None = None,
     ) -> None:
         if max_iterations < 1:
             raise ValueError("max_iterations must be positive.")
@@ -151,6 +158,7 @@ class AgentRunner:
         self.skill_manager = skill_manager
         self.retry_provider_errors = retry_provider_errors
         self.request_template = request_template
+        self.read_only_scheduler = read_only_scheduler
         self._last_successful_request: AgentRequest | None = None
         candidate_hooks = getattr(tools, "hook_engine", None)
         self.hook_engine = candidate_hooks if isinstance(candidate_hooks, HookEngine) else None
@@ -480,7 +488,7 @@ class AgentRunner:
             and not skill_catalog
             and not active_skill_prompt
             and not hook_prompts
-            and not _supports_structured_request(self.provider)
+            and not provider_supports_structured_requests(self.provider)
         ):
             return AgentRequest(history, tools, cancel_event=cancel_event)
         workspace = getattr(getattr(self.tools, "policy", None), "workspace", None)
@@ -584,16 +592,24 @@ class AgentRunner:
     ) -> tuple[list[ToolResult], bool]:
         if _is_cancelled(cancel_event):
             return ([_cancelled_result(call) for call in calls], True)
-        if len(calls) == 1:
+        is_read_only_batch = all(
+            self._is_known(call.name) and self._is_read_only(call.name) for call in calls
+        )
+        if len(calls) == 1 and not is_read_only_batch:
             call = calls[0]
             try:
                 return ([self._execute_tool(call, cancel_event, read_only_only=read_only_only)], False)
+            except ToolOutputStorageError:
+                raise
             except RequestCancelled:
                 return ([_cancelled_result(call)], True)
             except Exception:
                 return ([_failed_result(call)], False)
 
-        executor = ThreadPoolExecutor(max_workers=len(calls), thread_name_prefix="fakuicode-read")
+        executor = self.read_only_scheduler or DaemonFutureExecutor(
+            thread_name_prefix="fakuicode-read"
+        )
+        owns_executor = self.read_only_scheduler is None
         futures: list[Future[ToolResult]] = [
             executor.submit(
                 self._execute_tool,
@@ -612,16 +628,22 @@ class AgentRunner:
                     break
                 try:
                     results.append(future.result())
+                except ToolOutputStorageError:
+                    raise
                 except RequestCancelled:
                     cancelled = True
                     break
                 except Exception:
                     results.append(_failed_result(call))
         finally:
-            if cancelled:
-                executor.shutdown(wait=False, cancel_futures=True)
-            else:
-                executor.shutdown(wait=True)
+            if owns_executor:
+                if cancelled:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                else:
+                    executor.shutdown(wait=True)
+            elif cancelled:
+                for future in futures:
+                    future.cancel()
         if cancelled:
             results.extend(_cancelled_result(call) for call in calls[len(results) :])
         return results, cancelled
@@ -727,14 +749,3 @@ def _plan_instruction(mode: AgentMode, round_number: int) -> str:
     if mode != "plan":
         return ""
     return PLAN_MODE_SYSTEM_INSTRUCTION if round_number == 1 or round_number % 3 == 0 else PLAN_MODE_CONCISE_REMINDER
-
-
-def _supports_structured_request(provider: object) -> bool:
-    """Keep old custom providers working while built-in providers use AgentRequest."""
-
-    import inspect
-
-    try:
-        return "request" in inspect.signature(provider.stream_agent).parameters  # type: ignore[attr-defined]
-    except (TypeError, ValueError, AttributeError):
-        return False

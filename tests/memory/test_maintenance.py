@@ -37,10 +37,14 @@ class _StructuredProvider:
     def __init__(self, responses: list[list[AgentStreamEvent]]) -> None:
         self.responses = responses
         self.requests = []
+        self.close_calls = 0
 
     def stream_agent(self, messages, tools, *, request):
         self.requests.append(request)
         yield from self.responses.pop(0)
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 class _LegacyProvider:
@@ -122,6 +126,7 @@ def test_structured_stream_uses_an_independent_request_with_empty_tools(tmp_path
     assert "自动记忆维护" in request.system_prompt
     assert "never-serialize-this-key" not in request.messages[0].content
     assert "read project instructions" in request.messages[0].content
+    assert provider.close_calls == 1
 
 
 def test_model_contract_binds_provenance_and_derives_user_evidence_offsets(

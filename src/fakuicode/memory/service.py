@@ -7,7 +7,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Protocol
 
-from fakuicode.memory.identity import MemoryRegistry, ProjectIdentity, ProjectIdentityResolver
+from fakuicode.memory.identity import MemoryRegistry, ProjectIdentity
 from fakuicode.memory.maintenance import MaintenanceJob, MemoryMaintenanceCoordinator, MemoryMaintenanceRunner
 from fakuicode.memory.models import (
     AgentTurnContext,

@@ -56,6 +56,7 @@ def test_initialize_list_page_and_call_use_standard_requests() -> None:
         assert initialized.tools_supported
         assert first.next_cursor == "next"
         assert first.tools[1].name == 7
+        assert second.tools[0].name == "good"
         assert isinstance(raw.requests[0], types.ListToolsRequest)
         assert raw.requests[1].params.cursor == "next"  # type: ignore[union-attr]
         assert isinstance(raw.requests[2], types.CallToolRequest)
@@ -67,7 +68,9 @@ def test_initialize_list_page_and_call_use_standard_requests() -> None:
     asyncio.run(scenario())
 
 
-def test_stdio_end_to_end_initializes_paginates_calls_and_passes_explicit_env() -> None:
+def test_stdio_end_to_end_initializes_paginates_calls_and_passes_explicit_env(
+    tmp_path: Path,
+) -> None:
     async def scenario() -> None:
         fixture = Path(__file__).parents[1] / "fixtures" / "fake_mcp_stdio_server.py"
         config = ResolvedStdioServerConfig(
@@ -75,6 +78,7 @@ def test_stdio_end_to_end_initializes_paginates_calls_and_passes_explicit_env() 
             sys.executable,
             (str(fixture),),
             {"FAKUICODE_MCP_TEST": SecretText("stdio-ok")},
+            working_directory=tmp_path,
         )
         factory = McpSdkConnectionFactory()
         async with factory.connect(config) as session:
@@ -82,9 +86,15 @@ def test_stdio_end_to_end_initializes_paginates_calls_and_passes_explicit_env() 
             first = await session.list_tools()
             second = await session.list_tools(first.next_cursor)
             result = await session.call_tool("read_env", {})
+            cwd = await session.call_tool("read_cwd", {})
         assert initialized.tools_supported
-        assert [tool.name for tool in first.tools + second.tools] == ["echo", "read_env"]
+        assert [tool.name for tool in first.tools + second.tools] == [
+            "echo",
+            "read_env",
+            "read_cwd",
+        ]
         assert result.content[0].text == "stdio-ok"
+        assert Path(cwd.content[0].text or "").resolve() == tmp_path.resolve()
 
     asyncio.run(scenario())
 

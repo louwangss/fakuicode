@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from textual import on
 from textual.app import ComposeResult
 from textual.containers import Vertical
@@ -35,10 +37,21 @@ class McpTrustPrompt(Vertical):
         yield Static(f"项目 MCP Server：{request.identity.server_name}", classes="inline-choice-title", markup=False)
         if request.transport is McpTransportType.STDIO:
             yield Static(
-                f"stdio · command: {request.command} · args: {request.argument_count}",
+                "stdio · command: " + json.dumps(request.command, ensure_ascii=False),
                 classes="inline-choice-target",
                 markup=False,
             )
+            yield Static(
+                f"工作目录：{request.working_directory}",
+                classes="inline-choice-target",
+                markup=False,
+            )
+            for index, argument in enumerate(request.arguments):
+                yield Static(
+                    f"argv[{index}] = {json.dumps(argument, ensure_ascii=False)}",
+                    classes="inline-choice-target",
+                    markup=False,
+                )
         else:
             yield Static(f"HTTP · {request.redacted_url}", classes="inline-choice-target", markup=False)
         names = [

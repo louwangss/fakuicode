@@ -29,6 +29,7 @@ class PermissionEngine:
         session_rules: Iterable[Rule] = (),
         mode: PermissionMode | None = None,
         read_only_task: bool = False,
+        preauthorized: bool = False,
     ) -> Decision:
         if read_only_task and not subject.read_only:
             return Decision(DecisionKind.DENY, "Plan mode permits only read-only tools.", "task_mode")
@@ -58,6 +59,13 @@ class PermissionEngine:
 
         if subject.read_only:
             return Decision(DecisionKind.ALLOW, "Safe workspace read is allowed.", "safe_read")
+
+        if preauthorized:
+            return Decision(
+                DecisionKind.ALLOW,
+                "A host-scoped session capability allows this action.",
+                "session_capability",
+            )
 
         active_mode = mode or self.snapshot.mode
         if active_mode is PermissionMode.STRICT:

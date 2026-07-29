@@ -86,6 +86,25 @@ def test_trust_prompt_model_is_redacted(tmp_path: Path) -> None:
     assert request.referenced_variable_names == ("TOKEN",)
 
 
+def test_stdio_trust_request_preserves_full_argv_and_working_directory(
+    tmp_path: Path,
+) -> None:
+    long_argument = "value with spaces " + "x" * 200
+    request = build_trust_request(
+        tmp_path,
+        _stdio(
+            command="python executable",
+            args=("server.py", "--label", long_argument),
+        ),
+    )
+
+    assert request is not None
+    assert request.command == "python executable"
+    assert request.arguments == ("server.py", "--label", long_argument)
+    assert request.working_directory == tmp_path.resolve()
+    assert request.argument_count == 3
+
+
 def test_http_prompt_exposes_names_not_header_values(tmp_path: Path) -> None:
     config = HttpServerConfig(
         "web",

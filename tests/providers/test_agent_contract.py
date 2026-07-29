@@ -67,6 +67,7 @@ def test_agent_stream_event_carries_native_tool_call() -> None:
 def _native_write_call(protocol: str):
     from fakuicode.models import AgentMessage, ProviderConfig, ToolDefinition
     from fakuicode.providers.anthropic import AnthropicProvider
+    from fakuicode.providers.base import AgentRequest
     from fakuicode.providers.openai import OpenAIProvider
 
     if protocol == "anthropic":
@@ -81,9 +82,11 @@ def _native_write_call(protocol: str):
             ProviderConfig("openai", "gpt-test", "https://api.openai.com/v1", "test-key"),
             httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=stream))),
         )
-    events = provider.stream_agent(
-        [AgentMessage("user", "write a note")],
-        [ToolDefinition("write_file", "Write a file.", {"type": "object"})],
+    events = provider.stream_agent_request(
+        AgentRequest(
+            (AgentMessage("user", "write a note"),),
+            (ToolDefinition("write_file", "Write a file.", {"type": "object"}),),
+        )
     )
     return next(event.tool_call for event in events if event.kind == "tool_call")
 

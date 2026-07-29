@@ -8,6 +8,13 @@
 # 启动时使用的 profile 名；之后可在 TUI 输入 /model 切换。
 default_profile: glm-coding
 
+# Coordinator 模式必须同时满足这里为 true，且启动进程设置
+# FAKUICODE_COORDINATOR=1。默认关闭。开启后 Lead 只保留读取与受约束的
+# Team 控制工具，不暴露通用写文件、Shell 或普通 agent 工具。
+teams:
+  coordinator:
+    enabled: false
+
 profiles:
   # OpenAI 官方 API
   openai-fast:

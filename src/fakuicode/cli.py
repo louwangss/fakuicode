@@ -6,7 +6,7 @@ import argparse
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from fakuicode.config import load_profiles
+from fakuicode.config import load_profiles, load_team_config
 from fakuicode.errors import ConfigurationError
 from fakuicode.hooks.config import HookConfigRepository, HookPaths
 from fakuicode.hooks.trust import HookTrustRepository
@@ -25,6 +25,7 @@ from fakuicode.renderer import Renderer
 from fakuicode.storage import ConversationStore, default_store_path
 from fakuicode.skills.trust import SkillTrustRepository
 from fakuicode.tui.app import FakuicodeApp
+from fakuicode.teams.config import TeamFeatureConfig
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,6 +58,11 @@ def main(
         profiles = loaded_config if isinstance(loaded_config, ProfileSet) else ProfileSet({"default": loaded_config}, "default")
         config = profiles.active
         provider = provider_factory(config)
+        team_config = (
+            load_team_config(args.config)
+            if config_loader is load_profiles
+            else TeamFeatureConfig()
+        )
     except ConfigurationError as error:
         active_renderer.error(str(error))
         return 2
@@ -115,6 +121,8 @@ def main(
         skill_trust_repository=SkillTrustRepository(
             memory_home / ".fakuicode" / "skill-trust.yaml"
         ),
+        team_config=team_config,
+        team_home=memory_home / ".fakuicode" / "teams",
     ).run()
     return 0
 

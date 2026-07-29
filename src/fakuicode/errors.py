@@ -120,3 +120,7 @@ class ToolPolicyError(RuntimeError):
 
 class ToolExecutionError(RuntimeError):
     """Raised when an allowed local tool cannot complete its action."""
+
+
+class ToolOutputStorageError(RuntimeError):
+    """Raised when complete tool evidence cannot be stored before model continuation."""

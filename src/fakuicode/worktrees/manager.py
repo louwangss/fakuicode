@@ -211,7 +211,15 @@ class WorktreeManager:
                 except OSError:
                     pass
 
-    def create(self, identity: WorktreeIdentity) -> WorktreeLease:
+    def create(
+        self,
+        identity: WorktreeIdentity,
+        *,
+        base_ref: str = "HEAD",
+    ) -> WorktreeLease:
+        if not isinstance(base_ref, str) or not base_ref.strip() or len(base_ref) > 512:
+            raise WorktreeUnavailableError("Worktree 基线引用无效。")
+        base_ref = base_ref.strip()
         key = str(identity.session_id)
         with self._lock:
             if key in self._active:
@@ -240,7 +248,7 @@ class WorktreeManager:
         )
         base_sha = self.git.run(
             self.repo_root,
-            ("rev-parse", "--verify", "HEAD^{commit}"),
+            ("rev-parse", "--verify", f"{base_ref}^{{commit}}"),
             timeout=self.limits.metadata_timeout_seconds,
         ).stdout
         if _SHA.fullmatch(base_sha) is None:

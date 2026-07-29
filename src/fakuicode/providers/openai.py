@@ -38,9 +38,12 @@ _CONTEXT_OVERFLOW_PHRASES = (
 
 class OpenAIProvider:
     def __init__(self, config: ProviderConfig, client: httpx.Client | None = None) -> None:
-        self.config, self.client = config, client or httpx.Client(timeout=60.0)
+        self.config = config
+        self._owns_client = client is None
+        self.client = client if client is not None else httpx.Client(timeout=60.0)
         self._active_response: httpx.Response | None = None
         self._response_lock = RLock()
+        self._client_closed = False
 
     @property
     def capabilities(self) -> ProviderCapabilities:
@@ -54,6 +57,17 @@ class OpenAIProvider:
             response = self._active_response
         if response is not None:
             response.close()
+
+    def close(self) -> None:
+        """Cancel active work and close only a client created by this provider."""
+
+        self.cancel()
+        with self._response_lock:
+            if self._client_closed:
+                return
+            self._client_closed = True
+        if self._owns_client:
+            self.client.close()
 
     def stream_chat(self, messages: Sequence[Message]) -> Iterator[StreamEvent]:
         body = {
@@ -97,6 +111,14 @@ class OpenAIProvider:
         except (httpx.HTTPError, ValueError) as error:
             raise ProviderError(REQUEST_FAILED) from error
         raise ProviderError("OpenAI stream ended before completion.")
+
+    def stream_agent_request(self, request: AgentRequest) -> Iterator[AgentStreamEvent]:
+        return self.stream_agent(
+            request.messages,
+            request.tools,
+            cancel_event=request.cancel_event,
+            request=request,
+        )
 
     def stream_agent(
         self,

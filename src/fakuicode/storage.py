@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
 import sqlite3
 from threading import RLock
 from time import time_ns
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fakuicode.models import TimelineEvent, TimelineEventKind
 
@@ -87,6 +89,7 @@ class ConversationStore:
         skill_name: str | None = None,
         agent_name: str | None = None,
         status: str = "active",
+        conversation_id: str | None = None,
     ) -> ConversationRecord:
         if conversation_type not in {"main", "skill", "agent"}:
             raise ValueError("Invalid conversation type.")
@@ -104,10 +107,10 @@ class ConversationStore:
             or agent_name is not None
         ):
             raise ValueError("Main conversations cannot have child metadata.")
-        with self._lock, self._connection:
+        with self._write_transaction():
             now = self._next_conversation_timestamp()
             record = ConversationRecord(
-                str(uuid4()),
+                str(uuid4()) if conversation_id is None else str(UUID(conversation_id)),
                 title.strip() or DEFAULT_CONVERSATION_TITLE,
                 workspace.resolve(),
                 profile_name,
@@ -143,7 +146,7 @@ class ConversationStore:
     ) -> ConversationRecord:
         """Replace only the default title with a normalized first user prompt."""
 
-        with self._lock, self._connection:
+        with self._write_transaction():
             row = self._connection.execute(
                 "SELECT * FROM conversations WHERE id = ?",
                 (conversation_id,),
@@ -172,7 +175,7 @@ class ConversationStore:
     def backfill_default_conversation_titles(self) -> None:
         """Backfill default titles from first user messages without changing activity order."""
 
-        with self._lock, self._connection:
+        with self._write_transaction():
             rows = self._connection.execute(
                 """
                 SELECT conversations.id, timeline_events.content
@@ -213,10 +216,22 @@ class ConversationStore:
             raise KeyError("Conversation was not found.")
         return _record_from_row(row)
 
-    def list_conversations(self) -> list[ConversationRecord]:
+    def list_conversations(
+        self,
+        *,
+        workspace: Path | None = None,
+    ) -> list[ConversationRecord]:
+        parameters: tuple[object, ...] = ()
+        workspace_clause = ""
+        if workspace is not None:
+            workspace_clause = " AND workspace = ?"
+            parameters = (str(workspace.resolve()),)
         with self._lock:
             rows = self._connection.execute(
-                "SELECT * FROM conversations WHERE conversation_type = 'main' ORDER BY updated_at DESC"
+                "SELECT * FROM conversations "
+                "WHERE conversation_type = 'main'"
+                f"{workspace_clause} ORDER BY updated_at DESC",
+                parameters,
             ).fetchall()
         return [_record_from_row(row) for row in rows]
 
@@ -253,12 +268,37 @@ class ConversationStore:
         return count
 
     def delete_conversation(self, conversation_id: str) -> None:
-        with self._lock, self._connection:
-            self._connection.execute(
-                "DELETE FROM conversations WHERE parent_conversation_id = ?",
-                (conversation_id,),
-            )
+        with self._write_transaction():
             self._connection.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+
+    def conversation_subtree(
+        self,
+        conversation_id: str,
+    ) -> tuple[ConversationRecord, ...]:
+        """Return a root conversation and every recursive child with its workspace."""
+
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                WITH RECURSIVE subtree(id) AS (
+                    SELECT id FROM conversations WHERE id = ?
+                    UNION
+                    SELECT child.id
+                    FROM conversations AS child
+                    JOIN subtree ON child.parent_conversation_id = subtree.id
+                )
+                SELECT conversations.*
+                FROM conversations
+                JOIN subtree ON subtree.id = conversations.id
+                ORDER BY CASE WHEN conversations.id = ? THEN 0 ELSE 1 END,
+                         conversations.created_at,
+                         conversations.id
+                """,
+                (conversation_id, conversation_id),
+            ).fetchall()
+        if not rows:
+            raise KeyError("Conversation was not found.")
+        return tuple(_record_from_row(row) for row in rows)
 
     def child_conversation_ids(self, conversation_id: str) -> tuple[str, ...]:
         with self._lock:
@@ -271,7 +311,7 @@ class ConversationStore:
     def update_conversation_status(self, conversation_id: str, status: str) -> None:
         if status not in {"active", "completed", "error", "cancelled"}:
             raise ValueError("Invalid conversation status.")
-        with self._lock, self._connection:
+        with self._write_transaction():
             self._connection.execute(
                 "UPDATE conversations SET status = ?, updated_at = ? WHERE id = ?",
                 (status, self._next_conversation_timestamp(), conversation_id),
@@ -286,7 +326,7 @@ class ConversationStore:
         call_id: str | None = None,
         metadata: dict[str, object] | None = None,
     ) -> TimelineEvent:
-        with self._lock, self._connection:
+        with self._write_transaction():
             row = self._connection.execute(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM timeline_events WHERE conversation_id = ?",
                 (conversation_id,),
@@ -490,8 +530,9 @@ class ConversationStore:
         )
 
     def _initialize(self) -> None:
-        with self._lock, self._connection:
+        with self._lock:
             self._connection.execute("PRAGMA foreign_keys = ON")
+        with self._write_transaction():
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS conversations (
@@ -536,6 +577,20 @@ class ConversationStore:
             for name, statement in migrations.items():
                 if name not in columns:
                     self._connection.execute(statement)
+
+    @contextmanager
+    def _write_transaction(self) -> Iterator[None]:
+        """Serialize read-modify-write operations across SQLite connections."""
+
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self._connection.rollback()
+                raise
+            else:
+                self._connection.commit()
 
     def _next_conversation_timestamp(self) -> int:
         row = self._connection.execute(

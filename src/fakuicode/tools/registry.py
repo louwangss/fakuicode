@@ -6,7 +6,13 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from threading import Event, RLock
 
-from fakuicode.errors import RequestCancelled, ToolExecutionError, ToolPolicyError
+from fakuicode.errors import (
+    RequestCancelled,
+    ToolExecutionError,
+    ToolOutputStorageError,
+    ToolPolicyError,
+)
+from fakuicode.context_artifacts import ContextArtifactStore
 from fakuicode.hooks.models import HookEvent
 from fakuicode.hooks.runtime import HookEngine
 from fakuicode.models import ToolCall, ToolDefinition, ToolResult
@@ -46,6 +52,10 @@ class ToolRegistry:
         self._optional_names: set[str] = set()
         self._system_names: set[str] = set()
         self._visible_names: set[str] | None = None
+        self._include_system_tools = True
+        self._tool_ceiling: set[str] | None = None
+        self._ceiling_includes_system_tools = True
+        self._context_artifact_store: ContextArtifactStore | None = None
         self._lock = RLock()
         for tool in tools or _default_tools(policy):
             self.register(tool)
@@ -56,6 +66,23 @@ class ToolRegistry:
             if name in self._tools:
                 raise ValueError(f"Tool '{name}' is already registered.")
             self._tools[name] = tool
+            self._bind_artifact_store(tool)
+
+    def set_context_artifact_store(
+        self,
+        artifact_store: ContextArtifactStore | None,
+    ) -> None:
+        """Bind one session-owned artifact store to tools that support staged output."""
+
+        with self._lock:
+            self._context_artifact_store = artifact_store
+            for tool in self._tools.values():
+                self._bind_artifact_store(tool)
+
+    def _bind_artifact_store(self, tool: Tool) -> None:
+        bind = getattr(tool, "set_artifact_store", None)
+        if callable(bind):
+            bind(self._context_artifact_store)
 
     def register_system(self, tool: Tool) -> None:
         """Register a host control tool that is always model-visible and bypasses ordinary approval."""
@@ -74,10 +101,32 @@ class ToolRegistry:
         with self._lock:
             return frozenset(self._tools)
 
-    def set_visible_tools(self, names: Iterable[str] | None) -> None:
-        """Restrict provider-visible and executable tools; system tools remain available."""
+    def set_visible_tools(
+        self,
+        names: Iterable[str] | None,
+        *,
+        include_system_tools: bool = True,
+    ) -> None:
+        """Restrict provider-visible and executable tools.
+
+        System tools remain visible by default. Restricted host modes may opt out,
+        then explicitly allow only the control tools required by that mode.
+        """
         with self._lock:
             self._visible_names = None if names is None else set(names)
+            self._include_system_tools = include_system_tools
+
+    def set_tool_ceiling(
+        self,
+        names: Iterable[str] | None,
+        *,
+        include_system_tools: bool = True,
+    ) -> None:
+        """Set a host-owned ceiling that later scopes cannot broaden."""
+
+        with self._lock:
+            self._tool_ceiling = None if names is None else set(names)
+            self._ceiling_includes_system_tools = include_system_tools
 
     def replace_optional(self, name: str, tool: Tool | None) -> None:
         """Atomically replace one host-owned optional tool without touching defaults or MCP tools."""
@@ -98,7 +147,7 @@ class ToolRegistry:
             tools = tuple(
                 tool
                 for name, tool in self._tools.items()
-                if self._visible_names is None or name in self._visible_names or name in self._system_names
+                if self._is_visible_locked(name)
             )
         return [_reinforced_definition(tool.definition) for tool in tools if not read_only_only or tool.read_only]
 
@@ -122,11 +171,7 @@ class ToolRegistry:
         try:
             with self._lock:
                 tool = self._tools.get(call.name)
-                visible = (
-                    self._visible_names is None
-                    or call.name in self._visible_names
-                    or call.name in self._system_names
-                )
+                visible = self._is_visible_locked(call.name)
                 system_tool = call.name in self._system_names
             if tool is None:
                 raise ToolExecutionError(f"Unknown tool '{call.name}'.")
@@ -140,6 +185,7 @@ class ToolRegistry:
                 preparation.target,
                 tool.read_only,
                 preparation.permission_scope,
+                preparation.permission_capability,
             )
             if self.hook_engine is not None:
                 hook_result = self.hook_engine.dispatch(
@@ -181,6 +227,8 @@ class ToolRegistry:
             if prepared is not None:
                 result = ToolResult(call.id, call.name, False, "Tool execution was cancelled.", "tool action cancelled")
                 self._dispatch_post_hook(prepared, result, read_only_only, outcome="cancelled")
+            raise
+        except ToolOutputStorageError:
             raise
         except (ToolExecutionError, ToolPolicyError) as error:
             result = ToolResult(call.id, call.name, False, str(error), "tool action was rejected or failed")
@@ -257,6 +305,20 @@ class ToolRegistry:
                 return None
             messages.append(message.strip())
         return "\n".join(messages)
+
+    def _is_visible_locked(self, name: str) -> bool:
+        in_system = name in self._system_names
+        in_scope = (
+            self._visible_names is None
+            or name in self._visible_names
+            or (self._include_system_tools and in_system)
+        )
+        under_ceiling = (
+            self._tool_ceiling is None
+            or name in self._tool_ceiling
+            or (self._ceiling_includes_system_tools and in_system)
+        )
+        return in_scope and under_ceiling
 
     def close(self) -> None:
         if self._owns_permission_manager:

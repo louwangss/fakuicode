@@ -124,7 +124,9 @@ class ContextManager:
                 self.artifact_store.cleanup_stale_tombstones(
                     retained_conversation_ids=retained,
                 )
-            except OSError:
+                self.artifact_store.cleanup_orphaned_ephemeral_artifacts()
+                self.artifact_store.cleanup_orphaned_staging_files()
+            except (OSError, ValueError):
                 self.artifact_cleanup_failed = True
         self._usage_anchor: UsageAnchor | None = None
         self._consecutive_summary_failures = 0

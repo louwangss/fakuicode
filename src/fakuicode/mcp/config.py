@@ -126,6 +126,8 @@ class McpConfigRepository:
 def resolve_server(
     config: McpServerConfig,
     environment: Mapping[str, str],
+    *,
+    working_directory: Path | None = None,
 ) -> tuple[ResolvedServerConfig | None, McpDiagnostic | None]:
     """Expand secret-bearing values only and return a sanitized failure when needed."""
 
@@ -165,6 +167,7 @@ def resolve_server(
             resolved,
             config.enabled_tools,
             config.disabled_tools,
+            working_directory,
         ), None
     return ResolvedHttpServerConfig(
         config.name,

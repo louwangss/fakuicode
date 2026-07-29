@@ -10,7 +10,32 @@ from fakuicode.matching import GlobSyntaxError, compile_glob
 
 
 KNOWN_TOOLS = frozenset(
-    {"read_file", "write_file", "edit_file", "run_command", "find_files", "search_code"}
+    {
+        "read_file",
+        "write_file",
+        "edit_file",
+        "run_command",
+        "find_files",
+        "search_code",
+        "team_create",
+        "team_task_create",
+        "team_task_get",
+        "team_task_list",
+        "team_task_update",
+        "team_task_delete",
+        "team_message_send",
+        "team_inbox_list",
+        "team_plan_submit",
+        "team_plan_review",
+        "team_member_start",
+        "team_member_assign",
+        "team_member_resume",
+        "team_member_stop",
+        "team_task_complete",
+        "team_integrate_task",
+        "team_finalize_prepare",
+        "team_finalize",
+    }
 )
 _RULE_PATTERN = re.compile(r"([a-z_][a-z0-9_]{0,63})\((.+)\)", re.ASCII)
 _MCP_TOOL_PATTERN = re.compile(r"mcp__[a-z][a-z0-9_]{0,31}__[a-z_][a-z0-9_]*", re.ASCII)

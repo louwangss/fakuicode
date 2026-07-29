@@ -1,9 +1,53 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sqlite3
+from threading import Barrier
 
 import pytest
+
+
+def test_store_serializes_event_sequences_across_independent_connections(
+    tmp_path: Path,
+) -> None:
+    from fakuicode.storage import ConversationStore
+
+    database = tmp_path / "concurrent.sqlite3"
+    owner = ConversationStore(database)
+    conversation = owner.create_conversation("Concurrent", tmp_path, "default")
+    stores = [ConversationStore(database) for _ in range(8)]
+    start = Barrier(len(stores))
+
+    def append_batch(worker: int, store: ConversationStore) -> None:
+        start.wait()
+        for item in range(50):
+            store.append_event(
+                conversation.id,
+                "user",
+                f"worker-{worker}-event-{item}",
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(stores)) as executor:
+            futures = [
+                executor.submit(append_batch, worker, store)
+                for worker, store in enumerate(stores)
+            ]
+            for future in futures:
+                future.result()
+
+        events = owner.load_events(conversation.id)
+        assert [event.sequence for event in events] == list(range(1, 401))
+        assert {event.content for event in events} == {
+            f"worker-{worker}-event-{item}"
+            for worker in range(8)
+            for item in range(50)
+        }
+    finally:
+        for store in stores:
+            store.close()
+        owner.close()
 
 
 def test_store_migrates_existing_database_and_hides_skill_children(tmp_path: Path) -> None:

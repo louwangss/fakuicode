@@ -20,13 +20,12 @@ from textual.css.query import NoMatches
 from textual.widgets import Collapsible, OptionList, Static
 
 from fakuicode.errors import PermissionPersistenceError, ProviderError, RequestCancelled
-from fakuicode.hooks.config import HookConfigRepository, HookPaths
+from fakuicode.hooks.config import HookConfigRepository
 from fakuicode.hooks.models import HookConfigSnapshot, HookEvent
 from fakuicode.hooks.runtime import HookDiagnostic, HookEngine
 from fakuicode.hooks.trust import HookTrustIdentity, HookTrustRepository, HookTrustStorageError
 from fakuicode.commands import (
     DEFAULT_COMMAND_REGISTRY,
-    RESERVED_COMMAND_NAMES,
     CommandRegistry,
     compose_command_registry,
 )
@@ -58,43 +57,36 @@ from fakuicode.models import (
 )
 from fakuicode.permissions.config import PermissionConfigRepository, PermissionConfigSnapshot
 from fakuicode.permissions.manager import ApprovalBroker, PermissionManager
-from fakuicode.permissions.models import ApprovalChoice
-from fakuicode.permissions.safety import DangerousCommandGuard
 from fakuicode.providers.base import ChatProvider
 from fakuicode.providers.factory import create_provider
 from fakuicode.instructions import (
-    InstructionLoader,
     InstructionSnapshot,
     InstructionSnapshotLoader,
     sanitize_instruction_metadata,
 )
+from fakuicode.lifecycle import DEFAULT_COOPERATIVE_SHUTDOWN_GRACE_SECONDS
 from fakuicode.session import AgentSessionController, SessionController, delete_conversation_with_artifacts
-from fakuicode.skills import IsolatedSkillExecutor, SkillDiscovery, SkillManager
+from fakuicode.skills import SkillManager
 from fakuicode.skills.broker import SkillTrustBroker
 from fakuicode.skills.install import (
     SkillInstallDecision,
-    SkillInstaller,
     SkillInstallRequest,
     SkillPackageFetcher,
 )
 from fakuicode.skills.install_broker import SkillInstallBroker
 from fakuicode.skills.trust import SkillTrustRepository
-import fakuicode.skills as skill_package
 import fakuicode.subagents as subagent_package
 from fakuicode.storage import ConversationRecord, ConversationStore
-from fakuicode.subagents import AgentCatalog, ChildRuntimeFactory, TaskManager
-from fakuicode.subagents.tools import (
-    AgentTool,
-    SendMessageTool,
-    TaskGetTool,
-    TaskListTool,
-    TaskStopTool,
-)
-from fakuicode.tools.policy import WorkspacePolicy
+from fakuicode.tool_scheduler import ReadOnlyToolScheduler
+from fakuicode.subagents import AgentCatalog, TaskManager
+from fakuicode.teams.config import TeamFeatureConfig
+from fakuicode.teams.git import TeamGitCoordinator
+from fakuicode.teams.runtime import TeamRuntimeManager
+from fakuicode.teams.service import TeamService
+from fakuicode.subagents.tools import AgentTool
 from fakuicode.tools.base import ToolExecution
 from fakuicode.tools.registry import ToolRegistry
 from fakuicode.worktrees.manager import WorktreeError, WorktreeManager
-from fakuicode.worktrees.models import ChildExecutionContext
 from fakuicode.tui.model_picker import (
     ConfirmationScreen,
     MemoryChoice,
@@ -108,6 +100,12 @@ from fakuicode.tui.mcp_trust_prompt import McpTrustPrompt
 from fakuicode.tui.hook_trust_prompt import HookTrustPrompt
 from fakuicode.tui.skill_trust_prompt import SkillTrustPrompt
 from fakuicode.tui.skill_install_screen import SkillInstallScreen
+from fakuicode.tui.runtime import (
+    RuntimeBundle,
+    SessionFactory,
+    SessionFactoryDependencies,
+    TeamFeatureRuntime,
+)
 from fakuicode.tui.permission_prompt import (
     PermissionPrompt,
     PermissionSettingsAction,
@@ -200,12 +198,9 @@ def _build_resume_gap_reminder(updated_at: object, now: object) -> tuple[str, st
     return user_notice, model_reminder
 
 
-def _provider_supports_skill_context(provider: object) -> bool:
-    try:
-        parameters = inspect.signature(provider.stream_agent).parameters  # type: ignore[attr-defined]
-    except (AttributeError, TypeError, ValueError):
-        return False
-    return "request" in parameters or "system_instruction" in parameters
+_COORDINATOR_INSTRUCTIONS = """## Team Coordinator 模式
+
+你是当前 Team 的固定 Lead。把用户目标拆成带依赖的共享任务，优先派给成员并通过邮箱协调；你负责范围判断、审批、集成顺序和最终决策。不要直接修改文件，也不要尝试绕过隐藏的工具。成员提交验证过的任务提交后，使用专用 Team Git 工具集成；冲突无法安全解决时中止并向用户报告。"""
 
 
 class FakuicodeApp(App[None]):
@@ -248,6 +243,9 @@ class FakuicodeApp(App[None]):
         enable_subagent_background: bool = True,
         subagent_auto_background_seconds: float = 60.0,
         subagent_max_concurrent: int = 2,
+        team_config: TeamFeatureConfig = TeamFeatureConfig(),
+        team_home: Path | None = None,
+        team_environment: Mapping[str, str] | None = None,
         clock_ns: Callable[[], int] = time_ns,
     ) -> None:
         super().__init__()
@@ -299,6 +297,17 @@ class FakuicodeApp(App[None]):
         self._enable_subagent_background = enable_subagent_background
         self._subagent_auto_background_seconds = subagent_auto_background_seconds
         self._subagent_max_concurrent = subagent_max_concurrent
+        self._team_config = team_config
+        self._team_home = team_home
+        self._team_environment = (
+            os.environ if team_environment is None else team_environment
+        )
+        self._team_service: TeamService | None = None
+        self._team_runtime: TeamRuntimeManager | None = None
+        self._team_git: TeamGitCoordinator | None = None
+        self._coordinator_active = False
+        self._runtime_bundle: RuntimeBundle | None = None
+        self._team_feature: TeamFeatureRuntime | None = None
         builtin_agents = Path(subagent_package.__file__).parent / "builtin"
         user_agents = agent_user_root or self.workspace / ".fakuicode" / "__user_agents_disabled__"
         self._agent_catalog = AgentCatalog.load(
@@ -322,6 +331,7 @@ class FakuicodeApp(App[None]):
             {"app": {"workspace": str(self.workspace), "outcome": "started"}},
         )
         self._provider = provider or provider_factory(config)
+        self._read_only_scheduler = ReadOnlyToolScheduler()
         self.session = self._make_session(self._provider)
         self._last_prompt = next((message.content for message in reversed(self.session.history) if message.role == "user"), None)
         self._active_turn: AssistantTurn | None = None
@@ -344,205 +354,96 @@ class FakuicodeApp(App[None]):
         return self.store.create_conversation("New conversation", self.workspace, self.profile_name)
 
     def _make_session(self, provider: ChatProvider) -> SessionController | AgentSessionController:
-        if hasattr(provider, "stream_agent"):
-            broker = ApprovalBroker()
-            self._approval_broker = broker
-            policy = WorkspacePolicy(self.workspace)
-            permissions = PermissionManager(
-                self._permission_snapshot,
-                DangerousCommandGuard(self.workspace),
-                approval_handler=broker,
-                repository=self._permission_repository,
-            )
-            registry = ToolRegistry(
-                policy,
-                permission_manager=permissions,
-                hook_engine=self._hook_engine,
-            )
-            task_manager = TaskManager(max_concurrent=self._subagent_max_concurrent)
+        team_feature = TeamFeatureRuntime(
+            config=self._team_config,
+            home=self._team_home,
+            environment=self._team_environment,
+            worktree_manager=self._worktree_manager,
+            conversation=self.conversation,
+            agent_catalog=self._agent_catalog,
+            profile_name=self.profile_name,
+            on_coordinator_activated=self._on_coordinator_activated,
+        )
+        self._team_feature = team_feature
+        dependencies = SessionFactoryDependencies(
+            workspace=self.workspace,
+            config=self.config,
+            profiles=self.profiles,
+            profile_name=self.profile_name,
+            provider_factory=self._provider_factory,
+            store=self.store,
+            conversation=self.conversation,
+            permission_snapshot=self._permission_snapshot,
+            permission_repository=self._permission_repository,
+            hook_snapshot=self._hook_snapshot,
+            hook_repository=self._hook_repository,
+            hook_engine=self._hook_engine,
+            hook_diagnostic_sink=self._record_hook_diagnostic,
+            memory_service=self.memory_service,
+            read_only_scheduler=self._read_only_scheduler,
+            worktree_manager=self._worktree_manager,
+            agent_catalog=self._agent_catalog,
+            team_feature=team_feature,
+            mcp_adapters=self._mcp_adapters,
+            skill_user_root=self._skill_user_root,
+            skill_trust_repository=self._skill_trust_repository,
+            skill_fetcher=self._skill_fetcher,
+            skill_trust_broker=self._skill_trust_broker,
+            skill_install_broker=self._skill_install_broker,
+            enable_subagent_background=self._enable_subagent_background,
+            subagent_auto_background_seconds=self._subagent_auto_background_seconds,
+            subagent_max_concurrent=self._subagent_max_concurrent,
+            project_instructions=self.instruction_snapshot.text,
+            active_instructions=self._active_instructions,
+            create_child_provider=self._create_child_provider,
+            parent_request_provider=lambda: getattr(
+                getattr(getattr(self, "session", None), "runner", None),
+                "last_successful_request",
+                None,
+            ),
+            capture_readonly_memory_snapshot=self._capture_readonly_memory_snapshot,
+            cancel_event_provider=lambda: self._cancel_event,
+            on_skills_changed=self._schedule_command_registry_rebuild,
+        )
+        bundle = SessionFactory(dependencies).create(provider)
+        self._runtime_bundle = bundle
+        self._approval_broker = bundle.approval_broker
+        self._task_manager = bundle.task_manager
+        self._agent_tool = bundle.agent_tool
+        self.skill_manager = bundle.skill_manager
+        self._command_registry = bundle.command_registry
+        self._team_service = team_feature.service
+        self._team_runtime = team_feature.runtime
+        self._team_git = team_feature.git
+        self._coordinator_active = team_feature.coordinator_active
+        return bundle.session
 
-            def child_registry(
-                child_permissions: PermissionManager,
-                execution_context: ChildExecutionContext | None = None,
-            ) -> ToolRegistry:
-                child_workspace = (
-                    execution_context.execution_workspace
-                    if execution_context is not None
-                    else self.workspace
-                )
-                child_policy = WorkspacePolicy(
-                    child_workspace,
-                    mappings=(
-                        execution_context.mappings
-                        if execution_context is not None
-                        else ()
-                    ),
-                )
-                child_hook_rules = self._hook_snapshot.rules
-                if execution_context is not None:
-                    parent_paths = (
-                        self._hook_repository.paths
-                        if self._hook_repository is not None
-                        else HookPaths.for_workspace(self.workspace)
-                    )
-                    child_snapshot = HookConfigRepository(
-                        HookPaths(
-                            parent_paths.user,
-                            child_workspace / ".fakuicode" / "hooks.yaml",
-                            parent_paths.trust,
-                        ),
-                        child_workspace,
-                        project_trusted=False,
-                    ).load()
-                    child_hook_rules = tuple(
-                        rule
-                        for rule in child_snapshot.rules
-                        if rule not in child_snapshot.project_rules
-                    )
-                    if (
-                        self._hook_snapshot.project_trusted
-                        and child_snapshot.project_fingerprint
-                        == self._hook_snapshot.project_fingerprint
-                    ):
-                        child_hook_rules += child_snapshot.project_rules
-                child_hooks = HookEngine(
-                    child_hook_rules,
-                    diagnostic_sink=self._record_hook_diagnostic,
-                    workspace=child_workspace,
-                )
-                return ToolRegistry(
-                    child_policy,
-                    permission_manager=child_permissions,
-                    hook_engine=child_hooks,
-                )
+    def _on_coordinator_activated(self) -> None:
+        self._coordinator_active = True
+        current_session = getattr(self, "session", None)
+        current_runner = getattr(current_session, "runner", None)
+        if current_runner is not None:
+            current_runner.custom_instructions = self._active_instructions()
 
-            child_runtime = ChildRuntimeFactory(
-                store=self.store,
-                parent_conversation_id=self.conversation.id if self.conversation is not None else None,
-                workspace=self.workspace,
-                profiles=self.profiles,
-                active_profile_name=self.profile_name,
-                provider_factory=self._create_child_provider,
-                tool_registry_factory=child_registry,
-                parent_permissions=permissions,
-                approval_handler=broker,
-                project_instructions=self.instruction_snapshot.text,
-                parent_request_provider=lambda: getattr(
-                    getattr(getattr(self, "session", None), "runner", None),
-                    "last_successful_request",
-                    None,
-                ),
-                worktree_manager=self._worktree_manager,
-                project_instruction_provider=lambda child_workspace: InstructionLoader(
-                    child_workspace
-                ).load().text,
-                memory_service=self.memory_service,
-            )
-            agent_tool = AgentTool(
-                self._agent_catalog,
-                child_runtime,
-                task_manager,
-                inline_timeout_seconds=self._subagent_auto_background_seconds,
-                background_enabled=self._enable_subagent_background,
-            )
-            registry.register_system(agent_tool)
-            registry.register_system(TaskListTool(task_manager))
-            registry.register_system(TaskGetTool(task_manager))
-            registry.register_system(TaskStopTool(task_manager))
-            registry.register_system(SendMessageTool(task_manager))
-            self._task_manager = task_manager
-            self._agent_tool = agent_tool
-            for adapter in self._mcp_adapters:
-                registry.register(adapter)
-            if not _provider_supports_skill_context(provider):
-                self.skill_manager = None
-                self._command_registry = DEFAULT_COMMAND_REGISTRY
-                return AgentSessionController(
-                    provider,
-                    registry,
-                    store=self.store,
-                    conversation_id=self.conversation.id if self.conversation is not None else None,
-                    custom_instructions=self.instruction_snapshot.text,
-                    memory_service=self.memory_service,
-                )
-            user_root = self._skill_user_root or self.workspace / ".fakuicode" / "__user_skills_disabled__"
-            builtin_root = Path(skill_package.__file__).parent / "builtin"
-            discovery = SkillDiscovery(
-                self.workspace / ".fakuicode" / "skills",
-                user_root,
-                builtin_root,
-                reserved_commands=RESERVED_COMMAND_NAMES,
-            )
-            manager = SkillManager(
-                discovery,
-                registry,
-                context_window=self.config.context_window,
-                trust_repository=self._skill_trust_repository,
-                trust_handler=lambda request: self._skill_trust_broker.request(
-                    request,
-                    cancel_event=self._cancel_event,
-                ),
-            )
-            manager.refresh()
+    def _schedule_command_registry_rebuild(self) -> None:
+        if not self.is_running:
+            return
+        try:
+            self.call_from_thread(self._rebuild_command_registry)
+        except RuntimeError:
+            pass
 
-            def refresh_after_install() -> object:
-                snapshot = manager.refresh()
-                if self.is_running:
-                    try:
-                        self.call_from_thread(self._rebuild_command_registry)
-                    except RuntimeError:
-                        pass
-                return snapshot
-
-            manager.installer = SkillInstaller(
-                self.workspace,
-                user_root,
-                fetcher=self._skill_fetcher,
-                refresh=refresh_after_install,
-                builtin_root=builtin_root,
+    def _active_instructions(self) -> str:
+        if not self._coordinator_active:
+            return self.instruction_snapshot.text
+        return "\n\n".join(
+            part
+            for part in (
+                self.instruction_snapshot.text,
+                _COORDINATOR_INSTRUCTIONS,
             )
-            manager.install_confirmation = lambda preview, cancel: self._skill_install_broker.request(
-                preview,
-                cancel_event=cancel,
-            )
-
-            def skill_child_registry() -> ToolRegistry:
-                child_permissions = permissions.spawn_child(approval_handler=broker)
-                child = child_registry(child_permissions)
-                for adapter in self._mcp_adapters:
-                    child.register(adapter)
-                return child
-
-            executor = IsolatedSkillExecutor(
-                store=self.store,
-                parent_conversation_id=self.conversation.id,
-                workspace=self.workspace,
-                profiles=self.profiles,
-                active_profile_name=self.profile_name,
-                parent_messages=lambda: manager.parent_messages,
-                provider_factory=self._provider_factory,
-                tool_registry_factory=skill_child_registry,
-                custom_instructions=self.instruction_snapshot.text,
-                readonly_memory_snapshot=self._capture_readonly_memory_snapshot,
-            ) if self.store is not None and self.conversation is not None else None
-            if executor is not None:
-                manager.isolated_runner = lambda name, arguments, cancel: executor.run(
-                    manager.snapshot.skills[name], arguments, cancel
-                )
-            self.skill_manager = manager
-            self._rebuild_command_registry()
-            return AgentSessionController(
-                provider,
-                registry,
-                store=self.store,
-                conversation_id=self.conversation.id if self.conversation is not None else None,
-                custom_instructions=self.instruction_snapshot.text,
-                memory_service=self.memory_service,
-                skill_manager=manager,
-            )
-        self.skill_manager = None
-        self._command_registry = DEFAULT_COMMAND_REGISTRY
-        return SessionController(provider)
+            if part
+        )
 
     def compose(self) -> ComposeResult:
         yield ConversationView(id="conversation")
@@ -775,8 +676,10 @@ class FakuicodeApp(App[None]):
         if self._task_manager is not None:
             self._task_manager.close()
             self._task_manager = None
-        if isinstance(self.session, AgentSessionController):
-            self.session.close()
+        close_session = getattr(self.session, "close", None)
+        if callable(close_session):
+            close_session()
+        self._read_only_scheduler.close()
         self._hook_engine.dispatch(
             HookEvent.APP_STOP,
             {"app": {"workspace": str(self.workspace), "outcome": "completed"}},
@@ -807,7 +710,7 @@ class FakuicodeApp(App[None]):
         self._worktree_sweep_stop.set()
         thread = self._worktree_sweep_thread
         if thread is not None:
-            thread.join()
+            thread.join(DEFAULT_COOPERATIVE_SHUTDOWN_GRACE_SECONDS)
         self._worktree_sweep_thread = None
 
     def _run_worktree_sweeper(self) -> None:
@@ -1140,7 +1043,11 @@ class FakuicodeApp(App[None]):
     def _launch_mcp_discovery(self) -> None:
         resolved: list[ResolvedServerConfig] = []
         for config in self._mcp_ready_configs:
-            value, diagnostic = resolve_server(config, self._mcp_environment)
+            value, diagnostic = resolve_server(
+                config,
+                self._mcp_environment,
+                working_directory=self.workspace,
+            )
             if value is not None:
                 resolved.append(value)
                 continue
@@ -1264,8 +1171,8 @@ class FakuicodeApp(App[None]):
             return
         matches = [
             record
-            for record in self.store.list_conversations()
-            if record.id.startswith(prefix) and record.workspace.resolve() == self.workspace
+            for record in self._list_titled_conversations()
+            if record.id.startswith(prefix)
         ]
         if len(matches) != 1:
             self._notice("Session id was not found or is ambiguous.")
@@ -1318,17 +1225,35 @@ class FakuicodeApp(App[None]):
         if self.store is None:
             self._notice("Local session storage is unavailable.")
             return
-        matches = [record for record in self.store.list_conversations() if record.id.startswith(prefix)]
+        matches = [
+            record
+            for record in self._list_titled_conversations()
+            if record.id.startswith(prefix)
+        ]
         if len(matches) != 1:
             self._notice("Session id was not found or is ambiguous.")
             return
         deleted = matches[0]
+        deleting_current = (
+            self.conversation is not None and deleted.id == self.conversation.id
+        )
+        if deleting_current:
+            self._close_agent_session()
         try:
             result = delete_conversation_with_artifacts(self.store, deleted.id)
         except Exception:
+            if deleting_current:
+                try:
+                    self.session = self._make_session(self._provider)
+                except Exception:
+                    self._notice(
+                        "Session deletion failed; the saved conversation was retained, "
+                        "but it could not be reopened."
+                    )
+                    return
             self._notice("Session deletion failed; the saved conversation was retained.")
             return
-        if self.conversation is not None and deleted.id == self.conversation.id:
+        if deleting_current:
             self._new_conversation(reload_instructions=False)
         notice = f"Deleted {deleted.id[:8]}."
         if result.warning is not None:
@@ -1514,11 +1439,7 @@ class FakuicodeApp(App[None]):
         if self.store is None:
             self._notice("Local session storage is unavailable.")
             return None
-        records = [
-            record
-            for record in self._list_titled_conversations()
-            if record.workspace.resolve() == self.workspace
-        ]
+        records = self._list_titled_conversations()
         if not records:
             self._notice("No saved conversations.")
             return None
@@ -1557,7 +1478,7 @@ class FakuicodeApp(App[None]):
             self.store.backfill_default_conversation_titles()
         except Exception:
             pass
-        return self.store.list_conversations()
+        return self.store.list_conversations(workspace=self.workspace)
 
     def _open_memory_picker(self) -> None:
         service = self.memory_service
@@ -1728,8 +1649,18 @@ class FakuicodeApp(App[None]):
             manager = getattr(current.runner.tools, "permission_manager", None)
             if isinstance(manager, PermissionManager):
                 self._permission_snapshot = manager.snapshot
-            current.close()
+        close_session = getattr(current, "close", None)
+        if callable(close_session):
+            close_session()
         self._approval_broker = None
+        self._runtime_bundle = None
+        self._team_feature = None
+        self._team_service = None
+        self._team_runtime = None
+        self._team_git = None
+        self._coordinator_active = False
+        self.skill_manager = None
+        self._command_registry = DEFAULT_COMMAND_REGISTRY
         self._active_permission_request_id = None
 
     def _create_child_provider(self, config: ProviderConfig):

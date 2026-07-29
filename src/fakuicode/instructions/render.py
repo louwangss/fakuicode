@@ -11,7 +11,7 @@ from fakuicode.instructions.models import (
     InstructionScope,
     sanitize_instruction_metadata,
 )
-from fakuicode.instructions.parser import IncludeLine, TextLine
+from fakuicode.instructions.parser import TextLine
 
 
 _TRUNCATION_MARKER = "[instruction truncated]"

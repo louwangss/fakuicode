@@ -340,6 +340,25 @@ def test_tool_result_preview_is_bounded_and_keeps_metadata_head_and_tail() -> No
     assert ".fakuicode/context-artifacts/conversation/result.txt" in preview
 
 
+def test_stored_tool_result_preview_is_bounded_without_the_complete_output() -> None:
+    from fakuicode.context import approximate_token_count, build_stored_tool_result_preview
+
+    preview = build_stored_tool_result_preview(
+        head="HEAD-MARKER\n" + "h" * 2_000,
+        tail="t" * 2_000 + "\nTAIL-MARKER",
+        original_bytes=2_000_000,
+        original_tokens=500_000,
+        success=True,
+        read_path=".fakuicode/context-artifacts/conversation/command-digest.txt",
+        budget_tokens=500,
+    )
+
+    assert approximate_token_count(preview) <= 500
+    assert "HEAD-MARKER" in preview
+    assert "TAIL-MARKER" in preview
+    assert "2000000 bytes" in preview
+
+
 def test_retention_selection_keeps_recent_target_and_at_least_five_complete_groups() -> None:
     from fakuicode.context import ContextGroup, select_compaction_history
 

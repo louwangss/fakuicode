@@ -40,19 +40,15 @@ class ChatProvider(Protocol):
 
 
 class AgentProvider(Protocol):
-    """Native tool-calling provider contract used by the agent loop."""
+    """Canonical tool-calling provider contract used by the agent loop."""
 
     @property
     def capabilities(self) -> ProviderCapabilities: ...
 
-    def stream_agent(
-        self,
-        messages: Sequence[AgentMessage],
-        tools: Sequence[ToolDefinition],
-        *,
-        cancel_event: Event | None = None,
-        system_instruction: str = "",
-        request: AgentRequest | None = None,
-    ) -> Iterator[AgentStreamEvent]: ...
+    def stream_agent_request(self, request: AgentRequest) -> Iterator[AgentStreamEvent]: ...
 
     def cancel(self) -> None: ...
+
+
+class Provider(ChatProvider, AgentProvider, Protocol):
+    """Complete production Provider contract returned by the Provider factory."""

@@ -28,13 +28,26 @@ from fakuicode.skills.install import (
     SkillInstallScope,
     parse_install_source,
 )
-from fakuicode.skills.isolated import IsolatedSkillExecutor, select_recent_user_turns
 from fakuicode.skills.trust import (
     SkillTrustIdentity,
     SkillTrustRepository,
     SkillTrustRequest,
     SkillTrustStorageError,
 )
+
+
+def __getattr__(name: str):
+    """Lazily expose isolated execution without importing the session at package load."""
+
+    if name in {"IsolatedSkillExecutor", "select_recent_user_turns"}:
+        from fakuicode.skills.isolated import IsolatedSkillExecutor, select_recent_user_turns
+
+        exports = {
+            "IsolatedSkillExecutor": IsolatedSkillExecutor,
+            "select_recent_user_turns": select_recent_user_turns,
+        }
+        return exports[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "ActiveSkill",

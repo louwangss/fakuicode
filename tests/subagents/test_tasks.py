@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from threading import Event
+from time import monotonic
 
 import pytest
 
@@ -19,6 +20,7 @@ class FakeSession:
         self.prompts: list[str] = []
         self.cancelled = False
         self.closed = False
+        self.close_event = Event()
         self.execution = {"isolation": "shared"}
 
     def run_to_completion(self, prompt: str, *, event_sink=None) -> ChildRunResult:
@@ -44,6 +46,7 @@ class FakeSession:
     def close(self, *, status: str = "completed") -> None:
         del status
         self.closed = True
+        self.close_event.set()
         self.cancel()
 
 
@@ -51,6 +54,22 @@ class CrashingSession(FakeSession):
     def run_to_completion(self, prompt: str, *, event_sink=None) -> ChildRunResult:
         del prompt, event_sink
         raise RuntimeError("secret provider failure")
+
+
+class UnresponsiveSession(FakeSession):
+    def __init__(self, name: str, *, release: Event) -> None:
+        super().__init__(name)
+        self.release = release
+        self.started = Event()
+
+    def run_to_completion(self, prompt: str, *, event_sink=None) -> ChildRunResult:
+        del prompt, event_sink
+        self.started.set()
+        self.release.wait()
+        return ChildRunResult("late result", "completed")
+
+    def cancel(self) -> None:
+        self.cancelled = True
 
 
 def test_task_manager_tracks_completion_and_keeps_session_for_followup() -> None:
@@ -178,3 +197,71 @@ def test_background_crash_is_contained_and_notified_without_leaking_exception(
     assert "secret provider failure" not in snapshot.error
     assert manager.drain_notifications() == (task_id,)
     manager.close()
+
+
+def test_close_is_bounded_when_running_session_ignores_cancellation() -> None:
+    from fakuicode.subagents.tasks import TaskManager
+
+    release = Event()
+    manager = TaskManager(max_concurrent=1, shutdown_grace_seconds=0.02)
+    session = UnresponsiveSession("stuck", release=release)
+    task_id = manager.launch(session, "wait forever", "unresponsive task")
+    assert session.started.wait(timeout=1)
+
+    started = monotonic()
+    try:
+        report = manager.close()
+        elapsed = monotonic() - started
+
+        assert elapsed < 0.5
+        assert report.detached_task_ids == (task_id,)
+        assert session.cancelled is True
+        assert session.closed is False
+        snapshot = manager.get(task_id)
+        assert snapshot is not None and snapshot.status == "cancelling"
+    finally:
+        release.set()
+    assert session.close_event.wait(timeout=1)
+    assert manager.get(task_id).status == "cancelled"
+
+
+def test_close_cancels_queued_tasks_without_waiting_for_a_worker() -> None:
+    from fakuicode.subagents.tasks import TaskManager
+
+    release = Event()
+    manager = TaskManager(max_concurrent=1, shutdown_grace_seconds=0.02)
+    running = UnresponsiveSession("running", release=release)
+    running_id = manager.launch(running, "block", "running task")
+    assert running.started.wait(timeout=1)
+    queued = FakeSession("queued")
+    queued_id = manager.launch(queued, "later", "queued task")
+
+    try:
+        report = manager.close()
+
+        queued_snapshot = manager.get(queued_id)
+        assert queued_snapshot is not None
+        assert queued_snapshot.status == "cancelled"
+        assert queued_id not in report.detached_task_ids
+        assert report.detached_task_ids == (running_id,)
+        assert queued.closed is True
+    finally:
+        release.set()
+
+
+def test_daemon_workers_do_not_keep_the_interpreter_alive() -> None:
+    from fakuicode.subagents.tasks import TaskManager
+
+    release = Event()
+    manager = TaskManager(max_concurrent=1, shutdown_grace_seconds=0)
+    session = UnresponsiveSession("daemon", release=release)
+    manager.launch(session, "block", "daemon worker")
+    assert session.started.wait(timeout=1)
+
+    try:
+        workers = manager._workers.worker_threads
+        manager.close()
+        assert len(workers) == 1
+        assert all(worker.daemon for worker in workers)
+    finally:
+        release.set()

@@ -11,6 +11,7 @@ import yaml
 
 from fakuicode.errors import ConfigurationError
 from fakuicode.models import ProfileSet, ProviderConfig, ThinkingConfig
+from fakuicode.teams.config import TeamFeatureConfig, parse_team_config
 
 
 REQUIRED_FIELDS = ("protocol", "model", "base_url", "api_key")
@@ -42,6 +43,12 @@ def load_profiles(path: Path) -> ProfileSet:
     if not isinstance(active_name, str) or active_name not in profiles:
         raise ConfigurationError("Configuration field 'default_profile' must name an existing profile.")
     return ProfileSet(profiles, active_name)
+
+
+def load_team_config(path: Path) -> TeamFeatureConfig:
+    """Load additive Team feature gates without exposing provider secrets."""
+
+    return parse_team_config(_load_yaml(path))
 
 
 def _load_yaml(path: Path) -> Mapping[str, object]:
